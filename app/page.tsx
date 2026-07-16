@@ -37,10 +37,10 @@ function apiUrl(path: string) {
   return `${base}${path}`;
 }
 
-async function apiRequest<T>(path: string, body: unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
+async function apiRequest<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(apiUrl(path), {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...extraHeaders },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   const payload = await response.json().catch(() => ({}));
@@ -79,7 +79,6 @@ export default function Home() {
   const [sandboxSuggestions, setSandboxSuggestions] = useState<SandboxSuggestion[]>([]);
   const [suggestingSandbox, setSuggestingSandbox] = useState(false);
   const [useScavibeSandbox, setUseScavibeSandbox] = useState(false);
-  const [sandboxAccessKey, setSandboxAccessKey] = useState("");
   const [sandboxStatus, setSandboxStatus] = useState("");
 
   const activeResult = stage ? results[stage] : undefined;
@@ -119,11 +118,7 @@ export default function Home() {
     event.preventDefault();
     setError("");
     if (!repository.trim() || !appUrl.trim() || (!sandboxUrl.trim() && !useScavibeSandbox)) {
-      setError("Repository URL and deployed app URL are required. Select a sandbox URL or use the Scavibe disposable sandbox.");
-      return;
-    }
-    if (useScavibeSandbox && sandboxAccessKey.length < 32) {
-      setError("The Scavibe sandbox access key must contain at least 32 characters.");
+      setError("Repository URL and deployed app URL are required. Select a sandbox URL or enable the Scavibe disposable sandbox.");
       return;
     }
     setStage("performance");
@@ -138,7 +133,7 @@ export default function Home() {
         setSandboxStatus("Creating isolated Vercel project for the pinned GitHub commit…");
         const created = await apiRequest<VercelSandbox>("/sandboxes/vercel", {
           repository_url: repository.trim(), authorized_deployment: true,
-        }, { "X-Scavibe-Sandbox-Key": sandboxAccessKey });
+        });
         let sandbox = created;
         for (let attempt = 1; attempt <= 36; attempt += 1) {
           if (sandbox.ready_state.toUpperCase() === "READY" && sandbox.deployment_url) break;
@@ -151,14 +146,14 @@ export default function Home() {
           sandbox = statusPayload as VercelSandbox;
         }
         if (sandbox.ready_state.toUpperCase() !== "READY" || !sandbox.deployment_url) {
-          throw new Error("Vercel did not report READY within 180 seconds. The disposable project must be deleted from Vercel if it remains.");
+          throw new Error("Vercel did not report READY within 180 seconds. No load test was sent.");
         }
         setSandboxUrl(sandbox.deployment_url);
         setSandboxStatus("Sandbox ready. Sending bounded GET traffic, then deleting the sandbox project…");
         result = await apiRequest<StageResult>(`/sandboxes/vercel/${sandbox.deployment_id}/load-test`, {
           repository_url: repository.trim(), app_url: appUrl.trim(), ticket: sandbox.ticket,
           concurrent_users: users, duration_seconds: duration, jurisdictions,
-        }, { "X-Scavibe-Sandbox-Key": sandboxAccessKey });
+        });
         setSandboxStatus(result.sandbox_teardown === "deleted" ? "Sandbox project deleted after the test." : `Sandbox teardown: ${result.sandbox_teardown || "not reported"}`);
       } else {
         result = await apiRequest<StageResult>(`/audit-stages/${stage}`, payload);
@@ -217,7 +212,7 @@ export default function Home() {
   }
 
   if (!stage) {
-    return <main className="audit-shell"><div className="grid-noise" /><nav className="topbar"><a className="logo" href="#"><span>sc</span>avibe</a><p><i /> evidence-first launch audits</p></nav><section className="launch-wrap"><div className="launch-copy"><span className="eyebrow">The pre-launch control room</span><h1>See what your app does before users do.</h1><p>Bring a public GitHub repository. Use your own disposable deployment, or let Scavibe create an isolated Vercel build with no production secrets.</p><div className="promise-row"><span><Icon name="lock" /> Sandbox only</span><span><Icon name="check" /> Evidence pinned to commit</span></div></div><form className="intake-card" onSubmit={start}><div className="card-heading"><span>Begin a real audit</span><small>Stage 01 of 03</small></div><label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label><label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label><label className="checkline sandbox-choice"><input type="checkbox" checked={useScavibeSandbox} onChange={(event) => setUseScavibeSandbox(event.target.checked)} /><span>Deploy an isolated Scavibe-owned Vercel sandbox for this audit. It receives no production environment variables and is deleted after the load test.</span></label>{useScavibeSandbox && <label>Scavibe sandbox access key<input type="password" value={sandboxAccessKey} onChange={(event) => setSandboxAccessKey(event.target.value)} placeholder="Provided only to trusted Scavibe users" minLength={32} required /><small className="input-help">This gate key authorizes Scavibe sandbox creation. It is not your Vercel token or GitHub token.</small></label>}<label>Authorized sandbox URL {useScavibeSandbox ? "(manual alternative)" : ""}<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required={!useScavibeSandbox} /></label>{suggestingSandbox && <p className="suggestion-note">Searching GitHub deployment statuses for this repository…</p>}{sandboxSuggestions.length > 0 && <div className="sandbox-suggestions"><span>Suggested deployment URLs</span>{sandboxSuggestions.map((suggestion) => <button key={suggestion.url} type="button" onClick={() => setSandboxUrl(suggestion.url)}><i><Icon name="check" /></i><b>{suggestion.provider}</b><code>{suggestion.url}</code><small>{suggestion.environment} · {suggestion.commit_sha.slice(0, 8)}</small></button>)}<p>Suggestions come from GitHub deployment status evidence. Select one only if it is your disposable sandbox.</p></div>}<label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own or am explicitly authorized to load test this sandbox or deploy this repository in the Scavibe sandbox.</span></label>{error && <p className="form-error">{error}</p>}<button className="primary" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button></form></section><footer>Scavibe never sends load traffic to your live URL by default.</footer></main>;
+    return <main className="audit-shell"><div className="grid-noise" /><nav className="topbar"><a className="logo" href="#"><span>sc</span>avibe</a><p><i /> evidence-first launch audits</p></nav><section className="launch-wrap"><div className="launch-copy"><span className="eyebrow">The pre-launch control room</span><h1>See what your app does before users do.</h1><p>Bring a public GitHub repository. Use your own disposable deployment, or let Scavibe create an isolated Vercel build with no production secrets.</p><div className="promise-row"><span><Icon name="lock" /> Sandbox only</span><span><Icon name="check" /> Evidence pinned to commit</span></div></div><form className="intake-card" onSubmit={start}><div className="card-heading"><span>Begin a real audit</span><small>Stage 01 of 03</small></div><label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label><label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label><label className="checkline sandbox-choice"><input type="checkbox" checked={useScavibeSandbox} onChange={(event) => setUseScavibeSandbox(event.target.checked)} /><span>Use a disposable Scavibe Vercel sandbox. It receives no production environment variables and is deleted after this load test.</span></label><label>Authorized sandbox URL {useScavibeSandbox ? "(manual alternative)" : ""}<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required={!useScavibeSandbox} /></label>{suggestingSandbox && <p className="suggestion-note">Searching GitHub deployment statuses for this repository…</p>}{sandboxSuggestions.length > 0 && <div className="sandbox-suggestions"><span>Suggested deployment URLs</span>{sandboxSuggestions.map((suggestion) => <button key={suggestion.url} type="button" onClick={() => setSandboxUrl(suggestion.url)}><i><Icon name="check" /></i><b>{suggestion.provider}</b><code>{suggestion.url}</code><small>{suggestion.environment} · {suggestion.commit_sha.slice(0, 8)}</small></button>)}<p>Suggestions come from GitHub deployment status evidence. Select one only if it is your disposable sandbox.</p></div>}<label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own or am explicitly authorized to load test this sandbox or deploy this repository in the Scavibe sandbox.</span></label>{error && <p className="form-error">{error}</p>}<button className="primary" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button></form></section><footer>Scavibe never sends load traffic to your live URL by default.</footer></main>;
   }
 
   const stageMeta = stages.find((item) => item.id === stage)!;

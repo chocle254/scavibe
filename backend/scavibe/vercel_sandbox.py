@@ -42,6 +42,7 @@ class VercelSandboxSettings:
     signing_key: str
     team_id: str | None
     ttl_seconds: int
+    demo_mode: bool
 
     @classmethod
     def from_environment(cls) -> "VercelSandboxSettings":
@@ -50,7 +51,8 @@ class VercelSandboxSettings:
         signing_key = os.environ.get("SCAVIBE_SANDBOX_SIGNING_KEY", "").strip()
         if not token:
             raise VercelSandboxError("VERCEL_SANDBOX_TOKEN is required to provision a Scavibe-owned Vercel sandbox")
-        if len(access_key) < MIN_ACCESS_KEY_LENGTH:
+        demo_mode = os.environ.get("SCAVIBE_SANDBOX_DEMO_MODE", "false").strip().lower() == "true"
+        if not demo_mode and len(access_key) < MIN_ACCESS_KEY_LENGTH:
             raise VercelSandboxError("SCAVIBE_SANDBOX_ACCESS_KEY must contain at least 32 characters before sandbox provisioning is enabled")
         if len(signing_key) < MIN_SIGNING_KEY_LENGTH:
             raise VercelSandboxError("SCAVIBE_SANDBOX_SIGNING_KEY must contain at least 32 characters before sandbox provisioning is enabled")
@@ -67,6 +69,7 @@ class VercelSandboxSettings:
             signing_key=signing_key,
             team_id=os.environ.get("VERCEL_SANDBOX_TEAM_ID", "").strip() or None,
             ttl_seconds=ttl_seconds,
+            demo_mode=demo_mode,
         )
 
 

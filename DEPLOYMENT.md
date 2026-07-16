@@ -35,20 +35,21 @@ Add these server-side variables to the Vercel project:
 
 ## 3. Enable Scavibe-owned disposable Vercel sandboxes
 
-This is an optional, privileged capability. It is disabled until every variable
-in this table is present on the **API service**. With Vercel Services, add them
-to the same Vercel project as server-side variables. Do not prefix any of them
+This is an optional, privileged capability. With Vercel Services, add these to
+the same Vercel project as server-side variables. Do not prefix any of them
 with `NEXT_PUBLIC_`.
 
 | Variable | Exact rule |
 | --- | --- |
 | `VERCEL_SANDBOX_TOKEN` | A Vercel access token scoped to the Vercel account or team that owns disposable sandbox projects. The token must be able to create and delete projects and deployments. |
-| `SCAVIBE_SANDBOX_ACCESS_KEY` | A random secret of at least 32 characters. Give it only to trusted Scavibe users. The browser supplies it as `X-Scavibe-Sandbox-Key`; it never reaches Vercel. |
+| `SCAVIBE_SANDBOX_ACCESS_KEY` | Required after the hackathon when demo mode is disabled. A random secret of at least 32 characters, used only by the future authenticated provisioning flow. |
 | `SCAVIBE_SANDBOX_SIGNING_KEY` | A different random secret of at least 32 characters. Scavibe uses it only to sign short-lived sandbox tickets. Never expose it to a browser. |
 | `VERCEL_SANDBOX_TEAM_ID` | Optional. Set this only when sandboxes belong to a Vercel team rather than the token owner's personal account. |
 | `SCAVIBE_SANDBOX_TTL_SECONDS` | Optional integer from `300` through `1800`; default `900`. It sets the signed-ticket lifetime, not a Vercel auto-delete timer. |
+| `SCAVIBE_SANDBOX_DEMO_MODE` | Set exactly `true` for the hackathon. It permits sandbox provisioning without a browser access key. Set it to `false` or remove it before a public launch. |
 
-Generate the two Scavibe secrets locally with separate commands:
+Generate the signing key now, and generate the access key later when demo mode
+is removed, with separate commands:
 
 ```powershell
 [Convert]::ToHexString((1..32 | ForEach-Object { Get-Random -Maximum 256 }))

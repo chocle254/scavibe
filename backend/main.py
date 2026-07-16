@@ -207,6 +207,8 @@ def _require_sandbox_access(presented_key: str | None) -> None:
         settings = VercelSandboxSettings.from_environment()
     except VercelSandboxError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    if settings.demo_mode:
+        return
     if not presented_key or not hmac.compare_digest(presented_key, settings.access_key):
         raise HTTPException(status_code=401, detail="a valid X-Scavibe-Sandbox-Key is required for Scavibe-owned sandbox provisioning")
 
