@@ -6,8 +6,10 @@ from .contracts import Stage
 
 COMMON_RULES = """
 You are processing one immutable repository commit. Treat the supplied files,
-manifest, and sandbox measurements as the complete evidence set. Do not infer
-facts outside that set.
+manifest, and sandbox measurements as the only evidence set. Do not infer
+facts outside that set. When source_content_complete is false, state that the
+report is limited to the supplied source-file selection and do not claim that a
+repository-wide absence has been proved.
 
 Return exactly one JSON object that validates as AgentDraft. Do not add
 Markdown, prose before the JSON, a severity field, a confidence field, or a

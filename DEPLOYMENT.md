@@ -30,7 +30,7 @@ Add these server-side variables to the Vercel project:
 | `NVIDIA_API_KEY` | Server-side NVIDIA Build API key. |
 | `SCAVIBE_NVIDIA_MODEL` | `nvidia/llama-3.3-nemotron-super-49b-v1`. |
 | `SCAVIBE_ALLOWED_ORIGINS` | The exact Vercel preview origin, such as `https://scavibe-git-main-team.vercel.app`. |
-| `GITHUB_TOKEN` | Not required for the current agent backbone. |
+| `GITHUB_TOKEN` | Required for private-repository intake and for user-approved draft PR creation. Public repository intake works without it, subject to GitHub's unauthenticated API limit. |
 | `BLOB_READ_WRITE_TOKEN` | Not required for the current agent backbone. |
 
 `SCAVIBE_ALLOWED_ORIGINS` accepts comma-separated exact origins and cannot be
@@ -77,6 +77,9 @@ code. It contains only a public route, never an API key.
 
 ## Current deployment boundary
 
-The API validates supplied evidence bundles and calls specialist agents only
-after `NVIDIA_API_KEY` is configured. GitHub cloning, sandbox creation, Locust/
-k6 execution, report storage, SSE, and pull-request creation are not deployed.
+The API fetches public GitHub repositories at a pinned commit, runs bounded GET
+load tests against user-authorized HTTPS sandbox URLs, and calls specialist
+agents after `NVIDIA_API_KEY` is configured. Automatic sandbox deployment,
+route-aware browser journeys, persistent report storage, SSE, and source-code
+patch generation are not deployed. Draft PR creation is deployed for generated
+audit artifacts and legal drafts only; it does not modify application source.

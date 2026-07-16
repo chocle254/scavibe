@@ -1,185 +1,175 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 
-type StageKey = "performance" | "security" | "legal";
-
-type Stage = {
-  key: StageKey;
-  eyebrow: string;
+type Stage = "performance" | "security" | "legal";
+type Finding = {
   title: string;
-  subtitle: string;
-  accent: string;
-  systems: string[];
-  checks: string[];
-  finding: string;
+  statement: string;
+  remediation: string;
+  severity: "info" | "low" | "medium" | "high" | "critical";
+  risk_score: number;
+  confidence_score: number;
+  evidence: Array<{ kind: string; file_path?: string; start_line?: number; end_line?: number; endpoint?: string; observed_value?: number; threshold?: number; metric?: string }>;
+};
+type Report = { stage: Stage; summary: string; findings: Finding[]; limitations: string[]; evidence_commit_sha: string };
+type StageResult = {
+  stage: Stage;
+  repository: { commit_sha: string; selected_files: string[]; source_content_complete: boolean };
+  report: Report;
+  measurement?: { concurrent_users: number; duration_seconds: number; sample_count: number; p95_latency_ms: number; error_rate_percent: number };
+  successful_requests?: number;
+  failed_requests?: number;
 };
 
-const stages: Stage[] = [
-  {
-    key: "performance",
-    eyebrow: "01 / Performance",
-    title: "Find the moment it bends.",
-    subtitle: "A disposable sandbox is warmed, observed, and ramped through realistic traffic layers.",
-    accent: "#79f2c0",
-    systems: ["Sandbox deployment", "Route discovery", "Database connection pool", "CDN & asset cache"],
-    checks: ["10 concurrent users", "100 concurrent users", "1,000 user projection"],
-    finding: "Checkout p95 crosses 800 ms at the projected 300-user layer.",
-  },
-  {
-    key: "security",
-    eyebrow: "02 / Security",
-    title: "Trace the path an attacker sees.",
-    subtitle: "The codebase is mapped into authentication, input, secrets, and authorization layers before findings are ranked.",
-    accent: "#b6a5ff",
-    systems: ["Identity & sessions", "API authorization", "Input boundaries", "Secrets & dependencies"],
-    checks: ["Authentication flow", "SQL injection paths", "Object-level access control"],
-    finding: "One admin route needs a server-side ownership check before launch.",
-  },
-  {
-    key: "legal",
-    eyebrow: "03 / Legal compliance",
-    title: "Make data practices visible.",
-    subtitle: "Scavibe follows data from collection to vendor and region signals, then identifies the documents your product needs.",
-    accent: "#ffcd75",
-    systems: ["Data collection map", "Cookies & analytics", "Third-party processors", "Regional requirements"],
-    checks: ["Privacy disclosures", "Consent surface", "Retention & deletion signals"],
-    finding: "Privacy policy and analytics consent copy are needed for the current collection map.",
-  },
+const stages: Array<{ id: Stage; number: string; name: string; label: string }> = [
+  { id: "performance", number: "01", name: "Performance", label: "Sandbox load lab" },
+  { id: "security", number: "02", name: "Cybersecurity", label: "OWASP evidence review" },
+  { id: "legal", number: "03", name: "Legal", label: "Data & policy review" },
 ];
+const jurisdictionOptions = ["KE", "EU", "US-CA"];
 
-function Mark({ name }: { name: "bolt" | "shield" | "scale" | "arrow" | "check" }) {
-  const paths = {
-    bolt: <path d="m13 2-9 12h7l-1 8 10-13h-7l0-7Z" />,
-    shield: <path d="M12 3 5 6v5c0 5 3 8.5 7 10 4-1.5 7-5 7-10V6l-7-3Zm-3 9 2 2 4-4" />,
-    scale: <path d="M12 3v18m-7 0h14M5 7h14M5 7l-3 6h6L5 7Zm14 0-3 6h6l-3-6Z" />,
-    arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
-    check: <path d="m5 12 4 4L19 6" />,
-  };
-  return <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
+function apiUrl(path: string) {
+  const base = (process.env.NEXT_PUBLIC_BACKEND_URL || "/api").replace(/\/$/, "");
+  return `${base}${path}`;
 }
 
-function StageVisual({ stage, progress }: { stage: Stage; progress: number }) {
-  if (stage.key === "performance") {
-    return (
-      <div className="visual-frame perf-visual" style={{ "--accent": stage.accent } as React.CSSProperties}>
-        <div className="visual-label"><i className="signal-dot" /> sandbox load stream</div>
-        <div className="load-grid" aria-label="Animated load test visualization">
-          {[{ n: "10", text: "baseline" }, { n: "100", text: "steady traffic" }, { n: "1K", text: "projected surge" }].map((layer, index) => (
-            <div className={`load-layer layer-${index + 1}`} key={layer.n}>
-              <div className="layer-copy"><strong>{layer.n}</strong><span>{layer.text}</span></div>
-              <div className="traffic-lane"><b /><b /><b /><b /><b /></div>
-              <em>{index === 2 && progress > 45 ? "p95 842ms" : index === 1 ? "p95 214ms" : "p95 118ms"}</em>
-            </div>
-          ))}
-        </div>
-        <div className="meter"><span>Load progression</span><div><i style={{ width: `${Math.max(progress, 6)}%` }} /></div><b>{Math.round(progress)}%</b></div>
-      </div>
-    );
-  }
-  if (stage.key === "security") {
-    return (
-      <div className="visual-frame security-visual" style={{ "--accent": stage.accent } as React.CSSProperties}>
-        <div className="visual-label"><i className="signal-dot" /> live code trace</div>
-        <div className="terminal-lines">
-          <p><span>01</span><b>auth</b> validateSession(request)</p>
-          <p><span>02</span>route <b>/api/users/:id</b></p>
-          <p><span>03</span>query.where(<b>"owner_id"</b>, user.id)</p>
-          <p><span>04</span>input <b>sanitize(payload)</b></p>
-          <p><span>05</span>secret <b>env.DATABASE_URL</b></p>
-          <div className="scan-beam" style={{ top: `${14 + (progress / 100) * 68}%` }} />
-        </div>
-        <div className="node-map"><i /><i /><i /><i /><i /><i /></div>
-        <div className="scan-caption"><span>Scanning attack surface</span><b>{Math.max(1, Math.round(progress / 8))} paths traced</b></div>
-      </div>
-    );
-  }
-  return (
-    <div className="visual-frame legal-visual" style={{ "--accent": stage.accent } as React.CSSProperties}>
-      <div className="visual-label"><i className="signal-dot" /> data-use discovery</div>
-      <div className="document-stack">
-        <article className="doc doc-back"><span>COOKIE SIGNALS</span><i /><i /><i /></article>
-        <article className="doc doc-mid"><span>DATA MAP</span><i /><i /><i /><i /></article>
-        <article className="doc doc-front"><span>PRIVACY CHECK</span><i /><i /><i /><b>REVIEW</b></article>
-      </div>
-      <div className="data-orbit"><i /><i /><i /><i /></div>
-      <div className="scan-caption"><span>Following collected data</span><b>{Math.max(1, Math.round(progress / 10))} signals mapped</b></div>
-    </div>
-  );
+async function apiRequest<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(apiUrl(path), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.detail || `Request failed with HTTP ${response.status}`);
+  return payload as T;
+}
+
+function Icon({ name }: { name: "arrow" | "check" | "bolt" | "shield" | "scale" | "download" | "branch" | "lock" }) {
+  const paths = {
+    arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
+    check: <path d="m5 12 4 4L19 6" />,
+    bolt: <path d="m13 2-9 12h7l-1 8 10-13h-7l0-7Z" />,
+    shield: <path d="M12 3 5 6v5c0 5 3 8.5 7 10 4-1.5 7-5 7-10V6l-4 4-2-2" />,
+    scale: <path d="M12 3v18m-7 0h14M5 7h14M5 7l-3 6h6L5 7Zm14 0-3 6h6l-3-6Z" />,
+    download: <path d="M12 3v11m0 0 4-4m-4 4-4-4m-5 9h18" />,
+    branch: <path d="M6 3v12m0-12a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm0 12a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm12-6a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm-9-3c0 3 2 6 6 6" />,
+    lock: <path d="M7 10V7a5 5 0 0 1 10 0v3m-11 0h12v10H6V10Zm6 4v2" />,
+  };
+  return <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
 export default function Home() {
-  const [selected, setSelected] = useState(0);
-  const [totalProgress, setTotalProgress] = useState(0);
+  const [stage, setStage] = useState<Stage | null>(null);
+  const [repository, setRepository] = useState("");
+  const [appUrl, setAppUrl] = useState("");
+  const [sandboxUrl, setSandboxUrl] = useState("");
+  const [authorized, setAuthorized] = useState(false);
+  const [users, setUsers] = useState(100);
+  const [duration, setDuration] = useState(60);
+  const [jurisdictions, setJurisdictions] = useState<string[]>(["KE"]);
+  const [results, setResults] = useState<Partial<Record<Stage, StageResult>>>({});
   const [running, setRunning] = useState(false);
-  const [repository, setRepository] = useState("github.com/your-team/your-app");
-  const [appUrl, setAppUrl] = useState("your-app.vercel.app");
+  const [error, setError] = useState("");
+  const [prApproved, setPrApproved] = useState(false);
+  const [prUrl, setPrUrl] = useState("");
 
-  useEffect(() => {
-    if (!running) return;
-    const timer = window.setInterval(() => {
-      setTotalProgress((current) => {
-        const next = Math.min(current + 2.5, 300);
-        setSelected(Math.min(Math.floor(next / 100), 2));
-        if (next === 300) setRunning(false);
-        return next;
-      });
-    }, 85);
-    return () => window.clearInterval(timer);
-  }, [running]);
+  const activeResult = stage ? results[stage] : undefined;
+  const payload = useMemo(() => ({
+    repository_url: repository.trim(),
+    app_url: appUrl.trim(),
+    sandbox_url: sandboxUrl.trim() || undefined,
+    sandbox_authorized: authorized,
+    concurrent_users: users,
+    duration_seconds: duration,
+    jurisdictions,
+  }), [repository, appUrl, sandboxUrl, authorized, users, duration, jurisdictions]);
 
-  const activeStage = stages[selected];
-  const stageProgress = useMemo(() => Math.min(100, Math.max(0, totalProgress - selected * 100)), [selected, totalProgress]);
-
-  function startAudit(event: FormEvent) {
+  function start(event: FormEvent) {
     event.preventDefault();
-    setTotalProgress(0);
-    setSelected(0);
-    setRunning(true);
+    setError("");
+    if (!repository.trim() || !appUrl.trim() || !sandboxUrl.trim()) {
+      setError("Repository URL, deployed app URL, and authorized sandbox URL are required before a real load test can start.");
+      return;
+    }
+    setStage("performance");
   }
 
-  function statusFor(index: number) {
-    const progress = totalProgress - index * 100;
-    if (progress >= 100) return "complete";
-    if (progress > 0) return "running";
-    return "queued";
+  async function runStage() {
+    if (!stage) return;
+    setRunning(true); setError(""); setPrUrl("");
+    try {
+      const result = await apiRequest<StageResult>(`/audit-stages/${stage}`, payload);
+      setResults((current) => ({ ...current, [stage]: result }));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "The audit request failed.");
+    } finally { setRunning(false); }
   }
 
-  return (
-    <main>
-      <div className="ambient ambient-one" /><div className="ambient ambient-two" />
-      <nav className="nav"><a className="brand" href="#top"><span>sc</span>avibe</a><div className="nav-right"><span className="secure-pill"><i /> sandbox-first auditing</span><a href="#how-it-works">How it works</a><button className="ghost-button">Sign in <Mark name="arrow" /></button></div></nav>
+  function nextStage() {
+    if (stage === "performance") setStage("security");
+    if (stage === "security") setStage("legal");
+  }
 
-      <section className="hero" id="top">
-        <div className="hero-copy"><p className="kicker"><i /> launch with receipts, not hope</p><h1>Before your users find the cracks.</h1><p className="lede">Scavibe audits your vibe-coded app across performance, security, and compliance—then turns every issue into an understandable next move.</p></div>
-        <form className="audit-form" onSubmit={startAudit}>
-          <div className="form-top"><span>New pre-launch audit</span><small>~ 8 minutes</small></div>
-          <label>GitHub repository<input value={repository} onChange={(e) => setRepository(e.target.value)} aria-label="GitHub repository URL" /></label>
-          <label>Deployed app URL<input value={appUrl} onChange={(e) => setAppUrl(e.target.value)} aria-label="Deployed application URL" /></label>
-          <p className="sandbox-note"><Mark name="shield" /> We test a disposable sandbox by default. Your live app stays untouched.</p>
-          <button className="run-button" type="submit">{running ? "Audit in progress" : "Start audit"}<Mark name="arrow" /></button>
-        </form>
-      </section>
+  async function requestPullRequest() {
+    if (!activeResult || !prApproved) return;
+    setRunning(true); setError("");
+    try {
+      const result = await apiRequest<{ url: string }>("/audit-stages/pull-request", {
+        repository_url: repository,
+        report: activeResult.report,
+        jurisdictions,
+        approved: true,
+      });
+      setPrUrl(result.url);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Pull request creation failed.");
+    } finally { setRunning(false); }
+  }
 
-      <section className="workspace" id="how-it-works">
-        <header className="workspace-header"><div><p className="kicker"><i /> audit pipeline</p><h2>Three lenses. One launch decision.</h2></div><div className="run-state"><i className={running ? "is-running" : ""} />{running ? "Analysis is flowing" : totalProgress === 300 ? "Audit preview complete" : "Ready when you are"}</div></header>
-        <div className="stage-tabs" role="tablist" aria-label="Audit stages">
-          {stages.map((stage, index) => {
-            const status = statusFor(index);
-            return <button key={stage.key} role="tab" aria-selected={selected === index} onClick={() => setSelected(index)} className={`stage-tab ${selected === index ? "selected" : ""}`} style={{ "--accent": stage.accent } as React.CSSProperties}><span className={`stage-number ${status}`}>{status === "complete" ? <Mark name="check" /> : `0${index + 1}`}</span><span><b>{stage.key === "legal" ? "Legal" : stage.key[0].toUpperCase() + stage.key.slice(1)}</b><small>{status === "running" ? "Analyzing" : status === "complete" ? "Reviewed" : "Queued"}</small></span><em>{status === "running" ? `${Math.round(Math.min(100, Math.max(0, totalProgress - index * 100)))}%` : ""}</em></button>;
-          })}
-        </div>
+  async function downloadLegalBundle() {
+    if (!activeResult) return;
+    setRunning(true); setError("");
+    try {
+      const response = await fetch(apiUrl("/audit-stages/legal-artifacts"), {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ report: activeResult.report, jurisdictions }),
+      });
+      if (!response.ok) {
+        const message = await response.json().catch(() => ({}));
+        throw new Error(message.detail || `Download failed with HTTP ${response.status}`);
+      }
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(await response.blob());
+      link.download = "scavibe-legal-drafts.zip";
+      link.click();
+      URL.revokeObjectURL(link.href);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Legal draft download failed.");
+    } finally { setRunning(false); }
+  }
 
-        <div className="stage-panel" style={{ "--accent": activeStage.accent } as React.CSSProperties}>
-          <div className="panel-main"><div className="panel-intro"><p>{activeStage.eyebrow}</p><h3>{activeStage.title}</h3><span>{activeStage.subtitle}</span></div><StageVisual stage={activeStage} progress={stageProgress} /></div>
-          <aside className="inspection-panel"><div className="inspection-heading"><span>Inspection layers</span><b>{running && statusFor(selected) === "running" ? "Live" : "Preview"}</b></div><ol>{activeStage.systems.map((system, index) => <li key={system} className={stageProgress > index * 21 ? "revealed" : ""}><span>{String(index + 1).padStart(2, "0")}</span>{system}<i><Mark name="check" /></i></li>)}</ol><div className="test-list"><p>Current checks</p>{activeStage.checks.map((check, index) => <span key={check}><i className={stageProgress > (index + 1) * 24 ? "done" : ""} />{check}</span>)}</div></aside>
-        </div>
+  function toggleJurisdiction(value: string) {
+    setJurisdictions((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
+  }
 
-        <div className="finding-strip"><div className="finding-icon">{activeStage.key === "performance" ? <Mark name="bolt" /> : activeStage.key === "security" ? <Mark name="shield" /> : <Mark name="scale" />}</div><div><span>What this layer can surface</span><p>{activeStage.finding}</p></div><button onClick={() => setSelected((selected + 1) % 3)}>Explore next <Mark name="arrow" /></button></div>
-      </section>
+  if (!stage) {
+    return <main className="audit-shell"><div className="grid-noise" /><nav className="topbar"><a className="logo" href="#"><span>sc</span>avibe</a><p><i /> evidence-first launch audits</p></nav><section className="launch-wrap"><div className="launch-copy"><span className="eyebrow">The pre-launch control room</span><h1>See what your app does before users do.</h1><p>Bring a public GitHub repository and a disposable deployment. Scavibe pins the code commit, tests the sandbox, and walks you through every decision.</p><div className="promise-row"><span><Icon name="lock" /> Sandbox only</span><span><Icon name="check" /> Evidence pinned to commit</span></div></div><form className="intake-card" onSubmit={start}><div className="card-heading"><span>Begin a real audit</span><small>Stage 01 of 03</small></div><label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label><label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label><label>Authorized sandbox URL<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required /></label><label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own or am explicitly authorized to load test this sandbox.</span></label>{error && <p className="form-error">{error}</p>}<button className="primary" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button></form></section><footer>Scavibe never sends load traffic to your live URL by default.</footer></main>;
+  }
 
-      <section className="promise"><p>Every fix is proposed as a pull request.</p><span>Nothing touches your repository or production environment without your review.</span></section>
-      <footer><a className="brand" href="#top"><span>sc</span>avibe</a><p>Built for builders who care what happens after launch.</p><small>Legal drafts are starting points, not legal advice.</small></footer>
-    </main>
-  );
+  const stageMeta = stages.find((item) => item.id === stage)!;
+  const canAdvance = Boolean(activeResult) && stage !== "legal";
+  const sceneIcon = stage === "performance" ? "bolt" : stage === "security" ? "shield" : "scale";
+  return <main className={`audit-shell stage-${stage}`}><div className="grid-noise" /><nav className="topbar"><button className="logo button-logo" onClick={() => setStage(null)}><span>sc</span>avibe</button><p><i /> pinned repository audit</p></nav><div className="audit-layout"><aside className="pipeline"><div className="pipeline-title">Launch sequence<span>{stageMeta.label}</span></div>{stages.map((item, index) => { const complete = Boolean(results[item.id]); const active = item.id === stage; const locked = index > 0 && !results[stages[index - 1].id]; return <button key={item.id} className={`pipe-stage ${active ? "active" : ""} ${complete ? "complete" : ""}`} disabled={locked} onClick={() => setStage(item.id)}><b>{complete ? <Icon name="check" /> : item.number}</b><span>{item.name}<small>{complete ? "Report ready" : active ? "Current stage" : locked ? "Locked" : "Ready"}</small></span></button>; })}<div className="pipeline-note"><Icon name="lock" /> Each stage uses the exact Git commit returned by GitHub. Results never infer unseen source files.</div></aside><section className="stage-content"><header className="stage-header"><div><span className="eyebrow">{stageMeta.number} / {stageMeta.label}</span><h1>{stage === "performance" ? "Measure the point it bends." : stage === "security" ? "Follow the path an attacker sees." : "Make every data promise visible."}</h1></div><span className="commit-pill">{activeResult ? `commit ${activeResult.repository.commit_sha.slice(0, 8)}` : "Awaiting repository scan"}</span></header><div className="work-grid"><section className="lab-card"><div className="scene-head"><span><Icon name={sceneIcon as "bolt"} /> {stage === "performance" ? "Sandbox traffic map" : stage === "security" ? "OWASP inspection trace" : "Data-use document map"}</span><b>{running ? "Running" : activeResult ? "Measured" : "Ready"}</b></div><StageScene stage={stage} users={users} result={activeResult} running={running} /><div className="control-board">{stage === "performance" && <><label className="range-label">Concurrent users <strong>{users}</strong><input type="range" min="10" max="200" step="10" value={users} onChange={(event) => setUsers(Number(event.target.value))} /></label><label className="range-label">Test duration <strong>{duration}s</strong><input type="range" min="30" max="300" step="30" value={duration} onChange={(event) => setDuration(Number(event.target.value))} /></label><p className="safe-copy"><Icon name="lock" /> Hard safety limit: 200 users for 300 seconds. The test sends GET requests only to the authorized sandbox root.</p></>}{stage === "security" && <p className="stage-explainer">The repository is pinned to one Git commit, then the specialist reviews supplied source evidence for authentication, authorization, input handling, secrets, and dependency signals. Findings without exact source evidence are rejected.</p>}{stage === "legal" && <><p className="stage-explainer">Choose every jurisdiction you want reviewed. The legal stage maps observed collection signals; it does not declare legal compliance.</p><div className="jurisdiction-row">{jurisdictionOptions.map((item) => <button key={item} onClick={() => toggleJurisdiction(item)} className={jurisdictions.includes(item) ? "selected" : ""}>{jurisdictions.includes(item) && <Icon name="check" />}{item}</button>)}</div></>}</div><button className="primary run-stage" onClick={runStage} disabled={running || (stage === "legal" && jurisdictions.length === 0)}>{running ? "Auditing exact evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized sandbox test" : `Analyze repository for ${stage}`}<Icon name="arrow" /></button>{error && <p className="form-error panel-error">{error}</p>}</section><ReportPanel result={activeResult} stage={stage} /></div>{activeResult && <section className="evidence-section"><div className="evidence-top"><div><span className="eyebrow">Evidence set</span><h2>Files actually analyzed</h2><p>{activeResult.repository.source_content_complete ? "The supplied source selection includes every supported text file in the repository." : "The source selection reached a hard cap; absence claims are limited to the supplied files."}</p></div><span>{activeResult.repository.selected_files.length} selected files</span></div><div className="file-strip">{activeResult.repository.selected_files.slice(0, 16).map((path) => <code key={path}>{path}</code>)}</div></section>}{activeResult && <section className="action-row"><div><span className="eyebrow">Controlled next move</span><h2>{stage === "legal" ? "Generate the legal review pack." : "Keep the evidence with your repository."}</h2><p>{stage === "legal" ? "Download draft policy, terms, review notes, and a consent component. All legal files are marked as attorney-review drafts." : "A pull request is created only after you approve it. It contains the evidence-backed report—not unreviewed source-code changes."}</p></div><div className="actions"><label className="checkline"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing generated audit artifacts.</span></label><button className="secondary" disabled={!prApproved || running} onClick={requestPullRequest}><Icon name="branch" /> Create draft PR</button>{stage === "legal" && <button className="secondary" disabled={running} onClick={downloadLegalBundle}><Icon name="download" /> Download legal pack</button>}{prUrl && <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft pull request <Icon name="arrow" /></a>}{canAdvance && <button className="primary next-button" onClick={nextStage}>Continue to {stage === "performance" ? "cybersecurity" : "legal"}<Icon name="arrow" /></button>}</div></section>}</section></div></main>;
+}
+
+function StageScene({ stage, users, result, running }: { stage: Stage; users: number; result?: StageResult; running: boolean }) {
+  if (stage === "performance") return <div className="stage-scene performance-scene"><div className="traffic-caption"><span>Test load</span><b>{users} users</b></div><div className="traffic-lines">{[0, 1, 2].map((line) => <div className={`traffic-line ${running ? "running" : ""}`} key={line}><span>{line === 0 ? "10" : line === 1 ? "100" : users}</span><div>{Array.from({ length: 7 }).map((_, index) => <i key={index} style={{ animationDelay: `${-(index * 0.24 + line * 0.1)}s` }} />)}</div>{result?.measurement && <b>{line === 2 ? `${result.measurement.p95_latency_ms}ms p95` : line === 1 ? `${result.measurement.error_rate_percent}% errors` : "baseline"}</b>}</div>)}</div><div className="wave-chart"><i /><i /><i /><i /><i /></div></div>;
+  if (stage === "security") return <div className="stage-scene security-scene"><div className="code-paper">{["identity.verify(token)", "route /api/users/:id", "ownership.assert(user, id)", "input.sanitize(payload)", "database.query(statement)"].map((line, index) => <p key={line}><span>{String(index + 1).padStart(2, "0")}</span>{line}</p>)}<div className={running ? "scanline moving" : "scanline"} /></div><div className="security-orbit"><i /><i /><i /><i /></div><span className="scene-status">{running ? "Tracing evidence paths" : result ? "Evidence trace complete" : "Authentication · access · input"}</span></div>;
+  return <div className="stage-scene legal-scene"><div className="paper-stack"><article><b>DATA MAP</b><i /><i /><i /></article><article><b>PRIVACY</b><i /><i /><i /><i /></article><article><b>TERMS</b><i /><i /><i /><em>{running ? "SCANNING" : result ? "REVIEW" : "READY"}</em></article></div><div className="legal-orbit"><i /><i /><i /></div><span className="scene-status">Collection · processors · consent</span></div>;
+}
+
+function ReportPanel({ result, stage }: { result?: StageResult; stage: Stage }) {
+  if (!result) return <aside className="report-panel empty"><span className="eyebrow">Awaiting evidence</span><h2>{stage === "performance" ? "The sandbox controls are ready." : stage === "security" ? "The code review is ready." : "The data review is ready."}</h2><p>{stage === "performance" ? "Set the exact concurrent-user count, then launch a bounded test against the sandbox URL you authorized." : "Run this stage to fetch the current GitHub commit and produce a report only from supplied source evidence."}</p><div className="empty-steps"><span>01 Pin commit</span><span>02 Inspect evidence</span><span>03 Issue report</span></div></aside>;
+  return <aside className="report-panel"><div className="report-top"><span className="eyebrow">Stage report</span><b>{result.report.findings.length} finding{result.report.findings.length === 1 ? "" : "s"}</b></div>{result.measurement && <div className="metric-grid"><div><span>P95</span><strong>{result.measurement.p95_latency_ms}<small>ms</small></strong></div><div><span>Error rate</span><strong>{result.measurement.error_rate_percent}<small>%</small></strong></div><div><span>Requests</span><strong>{(result.successful_requests || 0) + (result.failed_requests || 0)}</strong></div></div>}<p className="report-summary">{result.report.summary}</p><div className="findings">{result.report.findings.length === 0 && <p className="no-findings"><Icon name="check" /> No configured threshold breach was found in this stage’s evidence.</p>}{result.report.findings.map((finding) => <article key={finding.title} className={`finding ${finding.severity}`}><div><span>{finding.severity}</span><b>{finding.risk_score}/100</b></div><h3>{finding.title}</h3><p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p></article>)}</div><details><summary>Evidence and limitations</summary><ul>{result.report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></aside>;
 }

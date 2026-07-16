@@ -107,6 +107,7 @@ class AuditContext(BaseModel):
     commit_sha: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
     source_files: Annotated[list[SourceFile], Field(min_length=1, max_length=2_000)]
     repository_paths: Annotated[list[str], Field(min_length=1, max_length=10_000)]
+    source_content_complete: bool = True
     runtime_measurements: list[RuntimeMeasurement] = Field(default_factory=list)
     jurisdictions: list[Annotated[str, Field(pattern=r"^[A-Z]{2}(-[A-Z]{2})?$")]] = Field(default_factory=list)
 
