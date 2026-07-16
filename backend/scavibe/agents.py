@@ -35,7 +35,6 @@ class Gateway(Protocol):
     async def generate(self, *, system_prompt: str, input_json: str) -> str: ...
 
 
-@dataclass(frozen=True)
 NVIDIA_NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_NVIDIA_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1"
 
