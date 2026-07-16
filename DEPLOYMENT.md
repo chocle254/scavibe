@@ -27,8 +27,8 @@ is still a visual pipeline preview. Do not enter an OpenAI API key in Vercel.
 
 | Variable | Required value |
 | --- | --- |
-| `OPENAI_API_KEY` | Server-side OpenAI API key. Never expose it to Vercel. |
-| `SCAVIBE_OPENAI_MODEL` | The owner-approved Responses API model identifier. No default exists. |
+| `NVIDIA_API_KEY` | Server-side NVIDIA Build API key. Never expose it to Vercel. |
+| `SCAVIBE_NVIDIA_MODEL` | `nvidia/llama-3.3-nemotron-super-49b-v1` for the selected NVIDIA free trial endpoint. |
 | `SCAVIBE_ALLOWED_ORIGINS` | The exact Vercel preview origin, for example `https://scavibe-git-main-team.vercel.app`. |
 | `GITHUB_TOKEN` | Not required for the current agent backbone; required only when repository integration is built. |
 | `BLOB_READ_WRITE_TOKEN` | Not required for the current agent backbone; required only when report storage is built. |
@@ -74,7 +74,8 @@ code. It contains only the public API URL, never an API key.
 ## Current deployment boundary
 
 The deployed API validates supplied evidence bundles and calls specialist
-agents only after `OPENAI_API_KEY` and `SCAVIBE_OPENAI_MODEL` are configured.
+agents only after `NVIDIA_API_KEY` is configured. It uses NVIDIA's selected
+free trial endpoint, which does not provide a production uptime guarantee.
 GitHub cloning, sandbox creation, Locust/k6 execution, report storage, SSE, and
 pull-request creation are not deployed yet. The service does not claim to run
 those integrations.

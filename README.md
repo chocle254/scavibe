@@ -2,7 +2,7 @@
 
 **AI-powered pre-launch audit for vibe-coded apps.**
 
-Built for OpenAI Build Week using Codex + GPT-5.6.
+Built using Codex + NVIDIA NIM.
 
 ---
 
@@ -103,7 +103,7 @@ Any legal documents (Terms & Conditions, Privacy Policy, consent components) gen
 |---|---|
 | Frontend | Next.js 14 (App Router) + Tailwind CSS, deployed to Vercel |
 | Backend | FastAPI (Python), async background tasks, deployed to Railway |
-| LLM | GPT-5.6 via the OpenAI API — powers all three agent stages |
+| LLM | NVIDIA NIM `nvidia/llama-3.3-nemotron-super-49b-v1` free trial endpoint — powers all three agent stages |
 | Load testing | Locust / k6, driven programmatically against a sandbox deployment |
 | GitHub integration | GitHub API — reads repos, opens pull requests |
 | Storage | Vercel Blob — reports and generated artifacts |
@@ -117,13 +117,14 @@ Any legal documents (Terms & Conditions, Privacy Policy, consent components) gen
 - Node.js 18+
 - Python 3.11+
 - A GitHub personal access token (repo scope)
-- An OpenAI API key with access to GPT-5.6
+- An NVIDIA Build API key with access to the selected NVIDIA NIM endpoint
 
 ### Environment Variables
 
 **Backend (`.env`)**
 ```
-OPENAI_API_KEY=sk-...
+NVIDIA_API_KEY=nvapi-...
+SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1
 GITHUB_TOKEN=ghp_...
 BLOB_READ_WRITE_TOKEN=...
 ```
@@ -165,4 +166,4 @@ traffic to a production URL by default.
 
 ## Built With
 
-Codex + GPT-5.6, used across all three agent stages for code understanding, security analysis, and document generation.
+Codex + NVIDIA NIM, used across all three agent stages for code understanding, security analysis, and document generation.

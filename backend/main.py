@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
-from scavibe.agents import AuditOrchestrator, OpenAIResponsesGateway, OpenAISettings
+from scavibe.agents import AuditOrchestrator, NvidiaNimGateway, NvidiaNimSettings
 from scavibe.contracts import AuditContext, AuditRun
 
 
@@ -101,10 +101,10 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
     if str(context.repository_url) != str(job.repository_url) or str(context.app_url) != str(job.app_url):
         raise HTTPException(status_code=422, detail="context URLs must equal the URLs used to create the audit")
     try:
-        settings = OpenAISettings.from_environment()
+        settings = NvidiaNimSettings.from_environment()
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    pipeline = AuditOrchestrator(OpenAIResponsesGateway(settings))
+    pipeline = AuditOrchestrator(NvidiaNimGateway(settings))
     result = await pipeline.run(context)
     job.status = "completed" if all(item.status != "failed" for item in result.stage_results) else "failed"
     return result
