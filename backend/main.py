@@ -41,6 +41,15 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def remove_vercel_api_prefix(request, call_next):
+    """Allow Vercel Services `/api/*` routing without changing Railway paths."""
+    if request.scope["path"] == "/api" or request.scope["path"].startswith("/api/"):
+        request.scope["path"] = request.scope["path"][4:] or "/"
+        request.scope["raw_path"] = request.scope["path"].encode("ascii")
+    return await call_next(request)
+
+
 class AuditRequest(BaseModel):
     repository_url: HttpUrl
     app_url: HttpUrl
