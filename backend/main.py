@@ -6,13 +6,14 @@ kept behind explicit integrations so no live target is ever tested by default.
 """
 
 import os
+import hmac
 from base64 import b64encode
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
@@ -32,8 +33,22 @@ from scavibe.contracts import (
     Stage,
 )
 from scavibe.load_test import LoadTestError, LoadTestSummary, run_sandbox_load_test
-from scavibe.repository import RepositoryIntakeError, RepositorySnapshot, fetch_public_repository, parse_github_repository
+from scavibe.repository import (
+    RepositoryIntakeError,
+    RepositorySnapshot,
+    fetch_public_repository,
+    fetch_repository_identity,
+    parse_github_repository,
+    suggest_sandboxes,
+)
 from scavibe.scoring import confidence_score, risk_score, severity_for
+from scavibe.vercel_sandbox import (
+    VercelSandboxError,
+    VercelSandboxSettings,
+    create_sandbox,
+    delete_sandbox,
+    get_sandbox,
+)
 
 
 def configured_origins() -> list[str]:
@@ -107,6 +122,7 @@ class StageAuditResponse(BaseModel):
     measurement: RuntimeMeasurement | None = None
     successful_requests: int | None = None
     failed_requests: int | None = None
+    sandbox_teardown: str | None = None
 
 
 class LegalArtifactRequest(BaseModel):
@@ -126,12 +142,187 @@ class PullRequestResponse(BaseModel):
     branch: str
 
 
+class SandboxSuggestionResponse(BaseModel):
+    url: HttpUrl
+    provider: str
+    environment: str
+    commit_sha: str
+
+
+class CreateVercelSandboxRequest(BaseModel):
+    repository_url: HttpUrl
+    authorized_deployment: bool = False
+
+
+class VercelSandboxResponse(BaseModel):
+    deployment_id: str
+    project_id: str
+    ready_state: str
+    deployment_url: HttpUrl | None = None
+    ticket: str
+    expires_at: int
+    commit_sha: str
+
+
+class VercelSandboxLoadTestRequest(BaseModel):
+    repository_url: HttpUrl
+    app_url: HttpUrl
+    ticket: str
+    concurrent_users: int = 100
+    duration_seconds: int = 60
+    jurisdictions: list[str] = []
+
+
 JOBS: dict[str, AuditJob] = {}
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "scavibe-api", "version": "0.1.0"}
+
+
+@app.get("/sandbox-suggestions", response_model=list[SandboxSuggestionResponse])
+async def sandbox_suggestions(repository_url: HttpUrl) -> list[SandboxSuggestionResponse]:
+    try:
+        suggestions = await suggest_sandboxes(str(repository_url))
+    except RepositoryIntakeError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return [SandboxSuggestionResponse(**suggestion.__dict__) for suggestion in suggestions]
+
+
+def _sandbox_response(sandbox) -> VercelSandboxResponse:
+    return VercelSandboxResponse(
+        deployment_id=sandbox.deployment_id,
+        project_id=sandbox.project_id,
+        ready_state=sandbox.ready_state,
+        deployment_url=sandbox.deployment_url,
+        ticket=sandbox.ticket,
+        expires_at=sandbox.expires_at,
+        commit_sha=sandbox.commit_sha,
+    )
+
+
+def _require_sandbox_access(presented_key: str | None) -> None:
+    try:
+        settings = VercelSandboxSettings.from_environment()
+    except VercelSandboxError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    if not presented_key or not hmac.compare_digest(presented_key, settings.access_key):
+        raise HTTPException(status_code=401, detail="a valid X-Scavibe-Sandbox-Key is required for Scavibe-owned sandbox provisioning")
+
+
+@app.post("/sandboxes/vercel", response_model=VercelSandboxResponse, status_code=201)
+async def provision_vercel_sandbox(
+    request: CreateVercelSandboxRequest,
+    x_scavibe_sandbox_key: str | None = Header(default=None),
+) -> VercelSandboxResponse:
+    """Provision an isolated, no-secret preview build for one GitHub commit."""
+    if request.authorized_deployment is not True:
+        raise HTTPException(status_code=422, detail="authorized_deployment=true is required before Scavibe deploys repository code")
+    _require_sandbox_access(x_scavibe_sandbox_key)
+    try:
+        identity = await fetch_repository_identity(str(request.repository_url))
+        sandbox = await create_sandbox(
+            repository_url=str(request.repository_url),
+            commit_sha=identity.commit_sha,
+            default_branch=identity.default_branch,
+        )
+    except (RepositoryIntakeError, VercelSandboxError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return _sandbox_response(sandbox)
+
+
+@app.get("/sandboxes/vercel/{deployment_id}", response_model=VercelSandboxResponse)
+async def read_vercel_sandbox(deployment_id: str, ticket: str) -> VercelSandboxResponse:
+    try:
+        sandbox = await get_sandbox(ticket)
+    except VercelSandboxError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if sandbox.deployment_id != deployment_id:
+        raise HTTPException(status_code=422, detail="sandbox ticket does not match the requested deployment")
+    return _sandbox_response(sandbox)
+
+
+@app.delete("/sandboxes/vercel/{deployment_id}", status_code=204)
+async def remove_vercel_sandbox(deployment_id: str, ticket: str) -> None:
+    try:
+        sandbox = await get_sandbox(ticket)
+    except VercelSandboxError as error:
+        # An expired ticket must still be allowed to clean up its known project.
+        try:
+            from scavibe.vercel_sandbox import read_ticket
+
+            settings = VercelSandboxSettings.from_environment()
+            old_ticket = read_ticket(settings, ticket, require_unexpired=False)
+            if old_ticket.deployment_id != deployment_id:
+                raise HTTPException(status_code=422, detail="sandbox ticket does not match the requested deployment")
+            await delete_sandbox(ticket)
+            return None
+        except VercelSandboxError as cleanup_error:
+            raise HTTPException(status_code=422, detail=str(cleanup_error)) from cleanup_error
+    if sandbox.deployment_id != deployment_id:
+        raise HTTPException(status_code=422, detail="sandbox ticket does not match the requested deployment")
+    try:
+        await delete_sandbox(ticket)
+    except VercelSandboxError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+
+
+@app.post("/sandboxes/vercel/{deployment_id}/load-test", response_model=StageAuditResponse)
+async def test_vercel_sandbox(
+    deployment_id: str,
+    request: VercelSandboxLoadTestRequest,
+    x_scavibe_sandbox_key: str | None = Header(default=None),
+) -> StageAuditResponse:
+    """Test the ready disposable deployment, then delete its project in all cases."""
+    _require_sandbox_access(x_scavibe_sandbox_key)
+    try:
+        sandbox = await get_sandbox(request.ticket)
+    except VercelSandboxError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if sandbox.deployment_id != deployment_id:
+        raise HTTPException(status_code=422, detail="sandbox ticket does not match the requested deployment")
+    if sandbox.ready_state.upper() != "READY" or sandbox.deployment_url is None:
+        raise HTTPException(status_code=409, detail=f"sandbox deployment is {sandbox.ready_state}; load testing starts only after Vercel reports READY")
+    stage_request = StageAuditRequest(
+        repository_url=request.repository_url,
+        app_url=request.app_url,
+        sandbox_url=sandbox.deployment_url,
+        sandbox_authorized=True,
+        concurrent_users=request.concurrent_users,
+        duration_seconds=request.duration_seconds,
+        jurisdictions=request.jurisdictions,
+    )
+    teardown = "deleted"
+    try:
+        snapshot = await _repository_snapshot(stage_request, [], commit_sha_override=sandbox.commit_sha)
+        test_summary = await run_sandbox_load_test(
+            sandbox_url=sandbox.deployment_url,
+            concurrent_users=request.concurrent_users,
+            duration_seconds=request.duration_seconds,
+        )
+        # The report uses the same immutable commit that the Vercel request was instructed to deploy.
+        snapshot.context.runtime_measurements.append(test_summary.measurement)
+        report = _performance_report(snapshot.context, test_summary)
+        result = StageAuditResponse(
+            stage=Stage.PERFORMANCE,
+            repository=_repository_summary(snapshot),
+            report=report,
+            measurement=test_summary.measurement,
+            successful_requests=test_summary.successful_requests,
+            failed_requests=test_summary.failed_requests,
+            sandbox_teardown=teardown,
+        )
+    except (RepositoryIntakeError, LoadTestError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        try:
+            await delete_sandbox(request.ticket)
+        except VercelSandboxError as teardown_error:
+            teardown = f"delete failed: {teardown_error}"
+    if teardown != "deleted":
+        result.sandbox_teardown = teardown
+    return result
 
 
 @app.post("/audits", response_model=AuditJob, status_code=201)
@@ -180,7 +371,9 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
     return result
 
 
-async def _repository_snapshot(request: StageAuditRequest, measurements: list[RuntimeMeasurement]) -> RepositorySnapshot:
+async def _repository_snapshot(
+    request: StageAuditRequest, measurements: list[RuntimeMeasurement], *, commit_sha_override: str | None = None
+) -> RepositorySnapshot:
     try:
         return await fetch_public_repository(
             audit_id=f"stage_{uuid4().hex[:20]}",
@@ -188,6 +381,7 @@ async def _repository_snapshot(request: StageAuditRequest, measurements: list[Ru
             app_url=str(request.app_url),
             jurisdictions=request.jurisdictions,
             runtime_measurements=measurements,
+            commit_sha_override=commit_sha_override,
         )
     except RepositoryIntakeError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error

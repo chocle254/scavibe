@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Stage = "performance" | "security" | "legal";
 type Finding = {
@@ -20,7 +20,10 @@ type StageResult = {
   measurement?: { concurrent_users: number; duration_seconds: number; sample_count: number; p95_latency_ms: number; error_rate_percent: number };
   successful_requests?: number;
   failed_requests?: number;
+  sandbox_teardown?: string;
 };
+type SandboxSuggestion = { url: string; provider: string; environment: string; commit_sha: string };
+type VercelSandbox = { deployment_id: string; ready_state: string; deployment_url?: string; ticket: string; expires_at: number; commit_sha: string };
 
 const stages: Array<{ id: Stage; number: string; name: string; label: string }> = [
   { id: "performance", number: "01", name: "Performance", label: "Sandbox load lab" },
@@ -34,10 +37,10 @@ function apiUrl(path: string) {
   return `${base}${path}`;
 }
 
-async function apiRequest<T>(path: string, body: unknown): Promise<T> {
+async function apiRequest<T>(path: string, body: unknown, extraHeaders: Record<string, string> = {}): Promise<T> {
   const response = await fetch(apiUrl(path), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: JSON.stringify(body),
   });
   const payload = await response.json().catch(() => ({}));
@@ -73,6 +76,11 @@ export default function Home() {
   const [error, setError] = useState("");
   const [prApproved, setPrApproved] = useState(false);
   const [prUrl, setPrUrl] = useState("");
+  const [sandboxSuggestions, setSandboxSuggestions] = useState<SandboxSuggestion[]>([]);
+  const [suggestingSandbox, setSuggestingSandbox] = useState(false);
+  const [useScavibeSandbox, setUseScavibeSandbox] = useState(false);
+  const [sandboxAccessKey, setSandboxAccessKey] = useState("");
+  const [sandboxStatus, setSandboxStatus] = useState("");
 
   const activeResult = stage ? results[stage] : undefined;
   const payload = useMemo(() => ({
@@ -85,11 +93,37 @@ export default function Home() {
     jurisdictions,
   }), [repository, appUrl, sandboxUrl, authorized, users, duration, jurisdictions]);
 
+  useEffect(() => {
+    const value = repository.trim();
+    if (!/^https:\/\/github\.com\/[^/]+\/[^/]+\/?$/.test(value)) {
+      setSandboxSuggestions([]);
+      return;
+    }
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      setSuggestingSandbox(true);
+      try {
+        const response = await fetch(`${apiUrl("/sandbox-suggestions")}?repository_url=${encodeURIComponent(value)}`);
+        const suggestions = response.ok ? await response.json() : [];
+        if (active) setSandboxSuggestions(suggestions as SandboxSuggestion[]);
+      } catch {
+        if (active) setSandboxSuggestions([]);
+      } finally {
+        if (active) setSuggestingSandbox(false);
+      }
+    }, 700);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [repository]);
+
   function start(event: FormEvent) {
     event.preventDefault();
     setError("");
-    if (!repository.trim() || !appUrl.trim() || !sandboxUrl.trim()) {
-      setError("Repository URL, deployed app URL, and authorized sandbox URL are required before a real load test can start.");
+    if (!repository.trim() || !appUrl.trim() || (!sandboxUrl.trim() && !useScavibeSandbox)) {
+      setError("Repository URL and deployed app URL are required. Select a sandbox URL or use the Scavibe disposable sandbox.");
+      return;
+    }
+    if (useScavibeSandbox && sandboxAccessKey.length < 32) {
+      setError("The Scavibe sandbox access key must contain at least 32 characters.");
       return;
     }
     setStage("performance");
@@ -99,7 +133,36 @@ export default function Home() {
     if (!stage) return;
     setRunning(true); setError(""); setPrUrl("");
     try {
-      const result = await apiRequest<StageResult>(`/audit-stages/${stage}`, payload);
+      let result: StageResult;
+      if (stage === "performance" && useScavibeSandbox) {
+        setSandboxStatus("Creating isolated Vercel project for the pinned GitHub commit…");
+        const created = await apiRequest<VercelSandbox>("/sandboxes/vercel", {
+          repository_url: repository.trim(), authorized_deployment: true,
+        }, { "X-Scavibe-Sandbox-Key": sandboxAccessKey });
+        let sandbox = created;
+        for (let attempt = 1; attempt <= 36; attempt += 1) {
+          if (sandbox.ready_state.toUpperCase() === "READY" && sandbox.deployment_url) break;
+          if (["ERROR", "CANCELED"].includes(sandbox.ready_state.toUpperCase())) throw new Error(`Vercel sandbox build ended as ${sandbox.ready_state}. No load test was sent.`);
+          setSandboxStatus(`Vercel build state: ${sandbox.ready_state}. Readiness check ${attempt}/36.`);
+          await new Promise((resolve) => window.setTimeout(resolve, 5000));
+          const response = await fetch(`${apiUrl(`/sandboxes/vercel/${created.deployment_id}`)}?ticket=${encodeURIComponent(created.ticket)}`);
+          const statusPayload = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(statusPayload.detail || `Sandbox status failed with HTTP ${response.status}`);
+          sandbox = statusPayload as VercelSandbox;
+        }
+        if (sandbox.ready_state.toUpperCase() !== "READY" || !sandbox.deployment_url) {
+          throw new Error("Vercel did not report READY within 180 seconds. The disposable project must be deleted from Vercel if it remains.");
+        }
+        setSandboxUrl(sandbox.deployment_url);
+        setSandboxStatus("Sandbox ready. Sending bounded GET traffic, then deleting the sandbox project…");
+        result = await apiRequest<StageResult>(`/sandboxes/vercel/${sandbox.deployment_id}/load-test`, {
+          repository_url: repository.trim(), app_url: appUrl.trim(), ticket: sandbox.ticket,
+          concurrent_users: users, duration_seconds: duration, jurisdictions,
+        }, { "X-Scavibe-Sandbox-Key": sandboxAccessKey });
+        setSandboxStatus(result.sandbox_teardown === "deleted" ? "Sandbox project deleted after the test." : `Sandbox teardown: ${result.sandbox_teardown || "not reported"}`);
+      } else {
+        result = await apiRequest<StageResult>(`/audit-stages/${stage}`, payload);
+      }
       setResults((current) => ({ ...current, [stage]: result }));
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The audit request failed.");
@@ -154,13 +217,13 @@ export default function Home() {
   }
 
   if (!stage) {
-    return <main className="audit-shell"><div className="grid-noise" /><nav className="topbar"><a className="logo" href="#"><span>sc</span>avibe</a><p><i /> evidence-first launch audits</p></nav><section className="launch-wrap"><div className="launch-copy"><span className="eyebrow">The pre-launch control room</span><h1>See what your app does before users do.</h1><p>Bring a public GitHub repository and a disposable deployment. Scavibe pins the code commit, tests the sandbox, and walks you through every decision.</p><div className="promise-row"><span><Icon name="lock" /> Sandbox only</span><span><Icon name="check" /> Evidence pinned to commit</span></div></div><form className="intake-card" onSubmit={start}><div className="card-heading"><span>Begin a real audit</span><small>Stage 01 of 03</small></div><label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label><label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label><label>Authorized sandbox URL<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required /></label><label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own or am explicitly authorized to load test this sandbox.</span></label>{error && <p className="form-error">{error}</p>}<button className="primary" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button></form></section><footer>Scavibe never sends load traffic to your live URL by default.</footer></main>;
+    return <main className="audit-shell"><div className="grid-noise" /><nav className="topbar"><a className="logo" href="#"><span>sc</span>avibe</a><p><i /> evidence-first launch audits</p></nav><section className="launch-wrap"><div className="launch-copy"><span className="eyebrow">The pre-launch control room</span><h1>See what your app does before users do.</h1><p>Bring a public GitHub repository. Use your own disposable deployment, or let Scavibe create an isolated Vercel build with no production secrets.</p><div className="promise-row"><span><Icon name="lock" /> Sandbox only</span><span><Icon name="check" /> Evidence pinned to commit</span></div></div><form className="intake-card" onSubmit={start}><div className="card-heading"><span>Begin a real audit</span><small>Stage 01 of 03</small></div><label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label><label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label><label className="checkline sandbox-choice"><input type="checkbox" checked={useScavibeSandbox} onChange={(event) => setUseScavibeSandbox(event.target.checked)} /><span>Deploy an isolated Scavibe-owned Vercel sandbox for this audit. It receives no production environment variables and is deleted after the load test.</span></label>{useScavibeSandbox && <label>Scavibe sandbox access key<input type="password" value={sandboxAccessKey} onChange={(event) => setSandboxAccessKey(event.target.value)} placeholder="Provided only to trusted Scavibe users" minLength={32} required /><small className="input-help">This gate key authorizes Scavibe sandbox creation. It is not your Vercel token or GitHub token.</small></label>}<label>Authorized sandbox URL {useScavibeSandbox ? "(manual alternative)" : ""}<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required={!useScavibeSandbox} /></label>{suggestingSandbox && <p className="suggestion-note">Searching GitHub deployment statuses for this repository…</p>}{sandboxSuggestions.length > 0 && <div className="sandbox-suggestions"><span>Suggested deployment URLs</span>{sandboxSuggestions.map((suggestion) => <button key={suggestion.url} type="button" onClick={() => setSandboxUrl(suggestion.url)}><i><Icon name="check" /></i><b>{suggestion.provider}</b><code>{suggestion.url}</code><small>{suggestion.environment} · {suggestion.commit_sha.slice(0, 8)}</small></button>)}<p>Suggestions come from GitHub deployment status evidence. Select one only if it is your disposable sandbox.</p></div>}<label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own or am explicitly authorized to load test this sandbox or deploy this repository in the Scavibe sandbox.</span></label>{error && <p className="form-error">{error}</p>}<button className="primary" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button></form></section><footer>Scavibe never sends load traffic to your live URL by default.</footer></main>;
   }
 
   const stageMeta = stages.find((item) => item.id === stage)!;
   const canAdvance = Boolean(activeResult) && stage !== "legal";
   const sceneIcon = stage === "performance" ? "bolt" : stage === "security" ? "shield" : "scale";
-  return <main className={`audit-shell stage-${stage}`}><div className="grid-noise" /><nav className="topbar"><button className="logo button-logo" onClick={() => setStage(null)}><span>sc</span>avibe</button><p><i /> pinned repository audit</p></nav><div className="audit-layout"><aside className="pipeline"><div className="pipeline-title">Launch sequence<span>{stageMeta.label}</span></div>{stages.map((item, index) => { const complete = Boolean(results[item.id]); const active = item.id === stage; const locked = index > 0 && !results[stages[index - 1].id]; return <button key={item.id} className={`pipe-stage ${active ? "active" : ""} ${complete ? "complete" : ""}`} disabled={locked} onClick={() => setStage(item.id)}><b>{complete ? <Icon name="check" /> : item.number}</b><span>{item.name}<small>{complete ? "Report ready" : active ? "Current stage" : locked ? "Locked" : "Ready"}</small></span></button>; })}<div className="pipeline-note"><Icon name="lock" /> Each stage uses the exact Git commit returned by GitHub. Results never infer unseen source files.</div></aside><section className="stage-content"><header className="stage-header"><div><span className="eyebrow">{stageMeta.number} / {stageMeta.label}</span><h1>{stage === "performance" ? "Measure the point it bends." : stage === "security" ? "Follow the path an attacker sees." : "Make every data promise visible."}</h1></div><span className="commit-pill">{activeResult ? `commit ${activeResult.repository.commit_sha.slice(0, 8)}` : "Awaiting repository scan"}</span></header><div className="work-grid"><section className="lab-card"><div className="scene-head"><span><Icon name={sceneIcon as "bolt"} /> {stage === "performance" ? "Sandbox traffic map" : stage === "security" ? "OWASP inspection trace" : "Data-use document map"}</span><b>{running ? "Running" : activeResult ? "Measured" : "Ready"}</b></div><StageScene stage={stage} users={users} result={activeResult} running={running} /><div className="control-board">{stage === "performance" && <><label className="range-label">Concurrent users <strong>{users}</strong><input type="range" min="10" max="200" step="10" value={users} onChange={(event) => setUsers(Number(event.target.value))} /></label><label className="range-label">Test duration <strong>{duration}s</strong><input type="range" min="30" max="300" step="30" value={duration} onChange={(event) => setDuration(Number(event.target.value))} /></label><p className="safe-copy"><Icon name="lock" /> Hard safety limit: 200 users for 300 seconds. The test sends GET requests only to the authorized sandbox root.</p></>}{stage === "security" && <p className="stage-explainer">The repository is pinned to one Git commit, then the specialist reviews supplied source evidence for authentication, authorization, input handling, secrets, and dependency signals. Findings without exact source evidence are rejected.</p>}{stage === "legal" && <><p className="stage-explainer">Choose every jurisdiction you want reviewed. The legal stage maps observed collection signals; it does not declare legal compliance.</p><div className="jurisdiction-row">{jurisdictionOptions.map((item) => <button key={item} onClick={() => toggleJurisdiction(item)} className={jurisdictions.includes(item) ? "selected" : ""}>{jurisdictions.includes(item) && <Icon name="check" />}{item}</button>)}</div></>}</div><button className="primary run-stage" onClick={runStage} disabled={running || (stage === "legal" && jurisdictions.length === 0)}>{running ? "Auditing exact evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized sandbox test" : `Analyze repository for ${stage}`}<Icon name="arrow" /></button>{error && <p className="form-error panel-error">{error}</p>}</section><ReportPanel result={activeResult} stage={stage} /></div>{activeResult && <section className="evidence-section"><div className="evidence-top"><div><span className="eyebrow">Evidence set</span><h2>Files actually analyzed</h2><p>{activeResult.repository.source_content_complete ? "The supplied source selection includes every supported text file in the repository." : "The source selection reached a hard cap; absence claims are limited to the supplied files."}</p></div><span>{activeResult.repository.selected_files.length} selected files</span></div><div className="file-strip">{activeResult.repository.selected_files.slice(0, 16).map((path) => <code key={path}>{path}</code>)}</div></section>}{activeResult && <section className="action-row"><div><span className="eyebrow">Controlled next move</span><h2>{stage === "legal" ? "Generate the legal review pack." : "Keep the evidence with your repository."}</h2><p>{stage === "legal" ? "Download draft policy, terms, review notes, and a consent component. All legal files are marked as attorney-review drafts." : "A pull request is created only after you approve it. It contains the evidence-backed report—not unreviewed source-code changes."}</p></div><div className="actions"><label className="checkline"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing generated audit artifacts.</span></label><button className="secondary" disabled={!prApproved || running} onClick={requestPullRequest}><Icon name="branch" /> Create draft PR</button>{stage === "legal" && <button className="secondary" disabled={running} onClick={downloadLegalBundle}><Icon name="download" /> Download legal pack</button>}{prUrl && <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft pull request <Icon name="arrow" /></a>}{canAdvance && <button className="primary next-button" onClick={nextStage}>Continue to {stage === "performance" ? "cybersecurity" : "legal"}<Icon name="arrow" /></button>}</div></section>}</section></div></main>;
+  return <main className={`audit-shell stage-${stage}`}><div className="grid-noise" /><nav className="topbar"><button className="logo button-logo" onClick={() => setStage(null)}><span>sc</span>avibe</button><p><i /> pinned repository audit</p></nav><div className="audit-layout"><aside className="pipeline"><div className="pipeline-title">Launch sequence<span>{stageMeta.label}</span></div>{stages.map((item, index) => { const complete = Boolean(results[item.id]); const active = item.id === stage; const locked = index > 0 && !results[stages[index - 1].id]; return <button key={item.id} className={`pipe-stage ${active ? "active" : ""} ${complete ? "complete" : ""}`} disabled={locked} onClick={() => setStage(item.id)}><b>{complete ? <Icon name="check" /> : item.number}</b><span>{item.name}<small>{complete ? "Report ready" : active ? "Current stage" : locked ? "Locked" : "Ready"}</small></span></button>; })}<div className="pipeline-note"><Icon name="lock" /> Each stage uses the exact Git commit returned by GitHub. Results never infer unseen source files.</div></aside><section className="stage-content"><header className="stage-header"><div><span className="eyebrow">{stageMeta.number} / {stageMeta.label}</span><h1>{stage === "performance" ? "Measure the point it bends." : stage === "security" ? "Follow the path an attacker sees." : "Make every data promise visible."}</h1></div><span className="commit-pill">{activeResult ? `commit ${activeResult.repository.commit_sha.slice(0, 8)}` : "Awaiting repository scan"}</span></header><div className="work-grid"><section className="lab-card"><div className="scene-head"><span><Icon name={sceneIcon as "bolt"} /> {stage === "performance" ? "Sandbox traffic map" : stage === "security" ? "OWASP inspection trace" : "Data-use document map"}</span><b>{running ? "Running" : activeResult ? "Measured" : "Ready"}</b></div><StageScene stage={stage} users={users} result={activeResult} running={running} /><div className="control-board">{stage === "performance" && <><label className="range-label">Concurrent users <strong>{users}</strong><input type="range" min="10" max="200" step="10" value={users} onChange={(event) => setUsers(Number(event.target.value))} /></label><label className="range-label">Test duration <strong>{duration}s</strong><input type="range" min="30" max="300" step="30" value={duration} onChange={(event) => setDuration(Number(event.target.value))} /></label><p className="safe-copy"><Icon name="lock" /> Hard safety limit: 200 users for 300 seconds. The test sends GET requests only to the authorized sandbox root.</p>{sandboxStatus && <p className="sandbox-status">{sandboxStatus}</p>}</>}{stage === "security" && <p className="stage-explainer">The repository is pinned to one Git commit, then the specialist reviews supplied source evidence for authentication, authorization, input handling, secrets, and dependency signals. Findings without exact source evidence are rejected.</p>}{stage === "legal" && <><p className="stage-explainer">Choose every jurisdiction you want reviewed. The legal stage maps observed collection signals; it does not declare legal compliance.</p><div className="jurisdiction-row">{jurisdictionOptions.map((item) => <button key={item} onClick={() => toggleJurisdiction(item)} className={jurisdictions.includes(item) ? "selected" : ""}>{jurisdictions.includes(item) && <Icon name="check" />}{item}</button>)}</div></>}</div><button className="primary run-stage" onClick={runStage} disabled={running || (stage === "legal" && jurisdictions.length === 0)}>{running ? "Auditing exact evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized sandbox test" : `Analyze repository for ${stage}`}<Icon name="arrow" /></button>{error && <p className="form-error panel-error">{error}</p>}</section><ReportPanel result={activeResult} stage={stage} /></div>{activeResult && <section className="evidence-section"><div className="evidence-top"><div><span className="eyebrow">Evidence set</span><h2>Files actually analyzed</h2><p>{activeResult.repository.source_content_complete ? "The supplied source selection includes every supported text file in the repository." : "The source selection reached a hard cap; absence claims are limited to the supplied files."}</p></div><span>{activeResult.repository.selected_files.length} selected files</span></div><div className="file-strip">{activeResult.repository.selected_files.slice(0, 16).map((path) => <code key={path}>{path}</code>)}</div></section>}{activeResult && <section className="action-row"><div><span className="eyebrow">Controlled next move</span><h2>{stage === "legal" ? "Generate the legal review pack." : "Keep the evidence with your repository."}</h2><p>{stage === "legal" ? "Download draft policy, terms, review notes, and a consent component. All legal files are marked as attorney-review drafts." : "A pull request is created only after you approve it. It contains the evidence-backed report—not unreviewed source-code changes."}</p></div><div className="actions"><label className="checkline"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing generated audit artifacts.</span></label><button className="secondary" disabled={!prApproved || running} onClick={requestPullRequest}><Icon name="branch" /> Create draft PR</button>{stage === "legal" && <button className="secondary" disabled={running} onClick={downloadLegalBundle}><Icon name="download" /> Download legal pack</button>}{prUrl && <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft pull request <Icon name="arrow" /></a>}{canAdvance && <button className="primary next-button" onClick={nextStage}>Continue to {stage === "performance" ? "cybersecurity" : "legal"}<Icon name="arrow" /></button>}</div></section>}</section></div></main>;
 }
 
 function StageScene({ stage, users, result, running }: { stage: Stage; users: number; result?: StageResult; running: boolean }) {

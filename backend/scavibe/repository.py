@@ -34,6 +34,22 @@ class RepositorySnapshot:
     source_content_complete: bool
 
 
+@dataclass(frozen=True)
+class SandboxSuggestion:
+    url: str
+    provider: str
+    environment: str
+    commit_sha: str
+
+
+@dataclass(frozen=True)
+class RepositoryIdentity:
+    owner: str
+    repository: str
+    default_branch: str
+    commit_sha: str
+
+
 def parse_github_repository(repository_url: str) -> tuple[str, str]:
     parsed = urlparse(repository_url)
     if parsed.scheme != "https" or parsed.netloc.lower() != "github.com":
@@ -57,22 +73,19 @@ def _sort_key(path: str) -> tuple[int, str]:
     return (0 if name in PRIORITY_NAMES else 1, path.lower())
 
 
-async def fetch_public_repository(
-    *, audit_id: str, repository_url: str, app_url: str, jurisdictions: list[str], runtime_measurements: list
-) -> RepositorySnapshot:
-    """Fetch at most 2 MiB of text source and the complete Git tree manifest.
-
-    The selection limits are exact: 120 files, 128 KiB per file, and 2 MiB
-    total. A truncated source selection is marked in the audit context and
-    cannot support repository-wide absence claims.
-    """
-    owner, repository = parse_github_repository(repository_url)
+def _github_headers() -> dict[str, str]:
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "scavibe-audit"}
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     if github_token:
         headers["Authorization"] = f"Bearer {github_token}"
+    return headers
+
+
+async def fetch_repository_identity(repository_url: str) -> RepositoryIdentity:
+    """Read the default branch and its immutable 40-character commit SHA."""
+    owner, repository = parse_github_repository(repository_url)
     timeout = httpx.Timeout(20.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers=headers) as client:
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers=_github_headers()) as client:
         repo_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}")
         if repo_response.status_code == 404:
             raise RepositoryIntakeError("GitHub repository was not found or is private without a valid GITHUB_TOKEN")
@@ -85,6 +98,40 @@ async def fetch_public_repository(
         if ref_response.status_code != 200:
             raise RepositoryIntakeError(f"GitHub branch reference request returned HTTP {ref_response.status_code}")
         commit_sha = ref_response.json().get("object", {}).get("sha")
+    if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+        raise RepositoryIntakeError("GitHub did not return a 40-character commit SHA")
+    return RepositoryIdentity(owner=owner, repository=repository, default_branch=default_branch, commit_sha=commit_sha)
+
+
+async def fetch_public_repository(
+    *, audit_id: str, repository_url: str, app_url: str, jurisdictions: list[str], runtime_measurements: list,
+    commit_sha_override: str | None = None,
+) -> RepositorySnapshot:
+    """Fetch at most 2 MiB of text source and the complete Git tree manifest.
+
+    The selection limits are exact: 120 files, 128 KiB per file, and 2 MiB
+    total. A truncated source selection is marked in the audit context and
+    cannot support repository-wide absence claims.
+    """
+    owner, repository = parse_github_repository(repository_url)
+    headers = _github_headers()
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers=headers) as client:
+        repo_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}")
+        if repo_response.status_code == 404:
+            raise RepositoryIntakeError("GitHub repository was not found or is private without a valid GITHUB_TOKEN")
+        if repo_response.status_code != 200:
+            raise RepositoryIntakeError(f"GitHub repository metadata request returned HTTP {repo_response.status_code}")
+        if commit_sha_override is None:
+            default_branch = repo_response.json().get("default_branch")
+            if not isinstance(default_branch, str) or not default_branch:
+                raise RepositoryIntakeError("GitHub repository has no readable default branch")
+            ref_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}/git/ref/heads/{default_branch}")
+            if ref_response.status_code != 200:
+                raise RepositoryIntakeError(f"GitHub branch reference request returned HTTP {ref_response.status_code}")
+            commit_sha = ref_response.json().get("object", {}).get("sha")
+        else:
+            commit_sha = commit_sha_override
         if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
             raise RepositoryIntakeError("GitHub did not return a 40-character commit SHA")
         tree_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}/git/trees/{commit_sha}?recursive=1")
@@ -139,3 +186,62 @@ async def fetch_public_repository(
         selected_paths=selected_paths,
         source_content_complete=source_content_complete,
     )
+
+
+async def suggest_sandboxes(repository_url: str) -> list[SandboxSuggestion]:
+    """Return verified GitHub deployment environment URLs for the default commit.
+
+    GitHub deployment status is the source of every suggestion. This function
+    makes no guess from a Vercel project name, branch name, or production URL.
+    It checks at most 20 deployment records and reads one latest status each.
+    """
+    owner, repository = parse_github_repository(repository_url)
+    headers = _github_headers()
+    timeout = httpx.Timeout(15.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, headers=headers) as client:
+        repo_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}")
+        if repo_response.status_code == 404:
+            raise RepositoryIntakeError("GitHub repository was not found or is private without a valid GITHUB_TOKEN")
+        if repo_response.status_code != 200:
+            raise RepositoryIntakeError(f"GitHub repository metadata request returned HTTP {repo_response.status_code}")
+        default_branch = repo_response.json().get("default_branch")
+        ref_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}/git/ref/heads/{default_branch}")
+        if ref_response.status_code != 200:
+            raise RepositoryIntakeError(f"GitHub branch reference request returned HTTP {ref_response.status_code}")
+        commit_sha = ref_response.json().get("object", {}).get("sha")
+        if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+            raise RepositoryIntakeError("GitHub did not return a 40-character commit SHA")
+        deployment_response = await client.get(
+            f"https://api.github.com/repos/{owner}/{repository}/deployments",
+            params={"sha": commit_sha, "per_page": 20},
+        )
+        if deployment_response.status_code != 200:
+            raise RepositoryIntakeError(f"GitHub deployment request returned HTTP {deployment_response.status_code}")
+        suggestions: list[SandboxSuggestion] = []
+        seen_urls: set[str] = set()
+        for deployment in deployment_response.json()[:20]:
+            deployment_id = deployment.get("id")
+            if not isinstance(deployment_id, int):
+                continue
+            status_response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repository}/deployments/{deployment_id}/statuses",
+                params={"per_page": 1},
+            )
+            if status_response.status_code != 200 or not status_response.json():
+                continue
+            status = status_response.json()[0]
+            environment_url = status.get("environment_url")
+            parsed = urlparse(environment_url) if isinstance(environment_url, str) else None
+            if not parsed or parsed.scheme != "https" or not parsed.hostname or environment_url in seen_urls:
+                continue
+            seen_urls.add(environment_url)
+            provider = "Vercel" if parsed.hostname.endswith("vercel.app") else parsed.hostname
+            suggestions.append(
+                SandboxSuggestion(
+                    url=environment_url.rstrip("/"),
+                    provider=provider,
+                    environment=str(deployment.get("environment") or "unknown"),
+                    commit_sha=commit_sha,
+                )
+            )
+    return suggestions
