@@ -46,7 +46,7 @@ class ZeroResponseClient:
 
 
 class RampLoadTestTests(unittest.IsolatedAsyncioTestCase):
-    async def test_all_failed_responses_emit_null_p95_and_error_rate_breaking_point(self) -> None:
+    async def test_completed_failures_emit_null_p95_and_100_percent_error_without_load_test_error(self) -> None:
         events: list[dict] = []
 
         async def on_event(event: dict) -> None:

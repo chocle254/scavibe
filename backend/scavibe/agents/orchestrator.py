@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..contracts import AuditContext, AuditRun, Stage, StageResult
+from ..contracts import AgentReport, AuditContext, AuditRun, Stage, StageResult
 from .base import SpecialistAgent
 from .gateway import AgentProtocolError, Gateway
 from .legal_agent import LEGAL_DISCLAIMER, LEGAL_PROMPT, validate_legal_finding
@@ -27,7 +27,16 @@ class AuditOrchestrator:
         for index, stage in enumerate(ordered_stages):
             prerequisite = self._prerequisite_reason(stage, context)
             if prerequisite:
-                results.append(StageResult(stage=stage, status="blocked", reason=prerequisite))
+                report = None
+                if stage == Stage.PERFORMANCE:
+                    report = AgentReport(
+                        stage=Stage.PERFORMANCE,
+                        summary="No performance finding was generated because no qualifying sandbox measurement was supplied.",
+                        findings=[],
+                        limitations=[prerequisite],
+                        evidence_commit_sha=context.commit_sha,
+                    )
+                results.append(StageResult(stage=stage, status="blocked", report=report, reason=prerequisite))
                 continue
             try:
                 report = await self._agents[stage].analyze(context)
@@ -51,7 +60,7 @@ class AuditOrchestrator:
             ]
             if not qualifying:
                 return (
-                    f"performance requires at least one sandbox measurement with {PERFORMANCE_MIN_CONCURRENT_USERS}+ concurrent users, "
+                    f"performance measurement did not meet the qualifying gate: at least {PERFORMANCE_MIN_CONCURRENT_USERS} concurrent users, "
                     f"{PERFORMANCE_MIN_DURATION_SECONDS}+ seconds, and {PERFORMANCE_MIN_SAMPLE_COUNT}+ samples"
                 )
         if stage == Stage.LEGAL and not context.jurisdictions:

@@ -3,13 +3,14 @@ import json
 import unittest
 from unittest.mock import patch
 
-from main import StageAuditRequest, _performance_report, audit_performance_ramp
+from main import StageAuditRequest, audit_performance_ramp
 from scavibe.contracts import RuntimeMeasurement
-from scavibe.load_test import LoadTestError, LoadTestSummary
+from scavibe.agents import AuditOrchestrator
+from tests.test_agents import FakeGateway, context
 
 
 class PerformanceRampEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_streams_json_sse_events_as_the_ramp_emits_them(self) -> None:
+    async def test_sse_stream_encodes_null_p95_as_json_null(self) -> None:
         async def fake_ramp(*, sandbox_url: str, on_event):
             await on_event(
                 {
@@ -60,19 +61,24 @@ class PerformanceRampEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"p95_latency_ms":null', chunks[1])
         self.assertEqual(decoded_events[2]["type"], "ramp_completed")
 
-    async def test_performance_report_rejects_a_nonqualifying_measurement(self) -> None:
+    async def test_nonqualifying_raw_breach_produces_zero_findings_and_qualifying_gate_limitation(self) -> None:
         measurement = RuntimeMeasurement(
             id="sandbox_low_load",
             target_mode="sandbox",
             endpoint="/",
             concurrent_users=10,
             duration_seconds=30,
-            sample_count=20,
-            successful_sample_count=20,
+            sample_count=25,
+            successful_sample_count=25,
             p95_latency_ms=900.0,
-            error_rate_percent=0.0,
+            error_rate_percent=5.0,
         )
-        summary = LoadTestSummary(measurement=measurement, successful_requests=20, failed_requests=0)
+        low_load_context = context().model_copy(update={"runtime_measurements": [measurement]})
+        run = await AuditOrchestrator(FakeGateway()).run(low_load_context)
+        performance = run.stage_results[0]
 
-        with self.assertRaisesRegex(LoadTestError, "at least 100 concurrent users, 60 seconds, and 20 samples"):
-            _performance_report(None, summary)
+        self.assertEqual(performance.stage, "performance")
+        self.assertEqual(performance.status, "blocked")
+        self.assertIsNotNone(performance.report)
+        self.assertEqual(performance.report.findings, [])
+        self.assertIn("did not meet the qualifying gate", performance.report.limitations[0])

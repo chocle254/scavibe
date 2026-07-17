@@ -6,6 +6,7 @@ from scavibe.agents.base import validate_draft
 from scavibe.agents.legal_agent import LEGAL_DISCLAIMER, validate_legal_finding
 from scavibe.agents.performance_agent import validate_performance_finding
 from scavibe.agents.security_agent import validate_security_finding
+from scavibe.agents.security_agent import SECURITY_PROMPT
 from scavibe.contracts import AgentDraft, AuditContext, Stage
 
 
@@ -140,6 +141,8 @@ class InvalidQuoteGateway:
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_security_score_is_deterministic(self) -> None:
+        self.assertIn('"stage", "summary", "findings", and "limitations"', SECURITY_PROMPT)
+        self.assertIn('"findings" is an\narray and must be []', SECURITY_PROMPT)
         report = await SpecialistAgent(Stage.SECURITY, FakeGateway()).analyze(context())
         finding = report.findings[0]
         self.assertEqual(finding.risk_score, 80)

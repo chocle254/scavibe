@@ -22,6 +22,13 @@ Return exactly one JSON object that validates as AgentDraft. Do not add
 Markdown, prose before the JSON, a severity field, a confidence field, or a
 risk score. The service calculates severity and confidence deterministically.
 
+The top-level JSON object must contain exactly these mandatory fields:
+"stage", "summary", "findings", and "limitations". "stage" is the supplied
+stage name. "summary" is a string of at least 20 characters. "findings" is an
+array and must be [] when no finding is verified. "limitations" is an array
+and must be [] when no limitation applies. Do not use aliases such as
+"finding", "result", "report", or "analysis" for any required field.
+
 Every finding requires at least one exact evidence item. A source evidence item
 must use a supplied file path, inclusive start_line and end_line values, and a
 quote copied exactly from that range. A runtime evidence item must use a
@@ -158,8 +165,18 @@ class SpecialistAgent:
         agent_context, omitted_file_count = context_for_agent(self._stage, context)
         raw_output = await self._gateway.generate(system_prompt=self._system_prompt, input_json=serialize_context(agent_context))
         try:
-            draft = AgentDraft.model_validate(json.loads(raw_output))
+            payload = json.loads(raw_output)
         except (json.JSONDecodeError, ValidationError) as error:
+            raise AgentProtocolError(f"{self._stage} response is not a valid AgentDraft: {error}") from error
+        if not isinstance(payload, dict):
+            raise AgentProtocolError(f"{self._stage} response must be a JSON object, received {type(payload).__name__}")
+        required_fields = ("stage", "summary", "findings", "limitations")
+        missing_fields = [field for field in required_fields if field not in payload]
+        if missing_fields:
+            raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
+        try:
+            draft = AgentDraft.model_validate(payload)
+        except ValidationError as error:
             raise AgentProtocolError(f"{self._stage} response is not a valid AgentDraft: {error}") from error
         report = validate_draft(self._stage, draft, context, self._stage_validator, self._required_limitation)
         if omitted_file_count:
