@@ -68,6 +68,6 @@ class NvidiaNimGateway:
         except Exception as error:
             raise AgentProtocolError(f"NVIDIA NIM request failed: {error}") from error
         content = response.choices[0].message.content if response.choices else None
-        if not content:
+        if not content or not content.strip():
             raise AgentProtocolError("NVIDIA NIM returned no message content")
         return content

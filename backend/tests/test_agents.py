@@ -99,7 +99,7 @@ class FakeGateway:
                     "limitations": [],
                 }
             )
-        return json.dumps(
+        legal_draft = json.dumps(
             {
                 "stage": "legal",
                 "summary": "No collection behavior is verified in the supplied source file.",
@@ -107,6 +107,7 @@ class FakeGateway:
                 "limitations": ["No supplied source evidence establishes personal-data collection."],
             }
         )
+        return f"```json\n{legal_draft}\n```"
 
 
 class InvalidQuoteGateway:

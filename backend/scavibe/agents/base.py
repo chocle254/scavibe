@@ -46,6 +46,25 @@ MAX_AGENT_SOURCE_FILES = 60
 StageValidator = Callable[[ProposedFinding, AuditContext], None]
 
 
+def _parse_agent_json(raw_output: str, stage: Stage) -> dict:
+    """Accept one JSON object, optionally wrapped in one Markdown JSON fence."""
+    content = raw_output.lstrip("\ufeff").strip()
+    if not content:
+        raise AgentProtocolError(f"{stage} response is empty; expected one AgentDraft JSON object")
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if len(lines) < 3 or lines[0].strip().lower() not in {"```", "```json"} or lines[-1].strip() != "```":
+            raise AgentProtocolError(f"{stage} response is not a single fenced AgentDraft JSON object")
+        content = "\n".join(lines[1:-1]).strip()
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise AgentProtocolError(f"{stage} response is not valid JSON: {error.msg} at line {error.lineno}, column {error.colno}") from error
+    if not isinstance(payload, dict):
+        raise AgentProtocolError(f"{stage} response must be a JSON object, received {type(payload).__name__}")
+    return payload
+
+
 def serialize_context(context: AuditContext) -> str:
     """Use JSON to preserve exact paths, lines, metrics, and target mode."""
     return context.model_dump_json(exclude_none=True)
@@ -164,12 +183,7 @@ class SpecialistAgent:
     async def analyze(self, context: AuditContext) -> AgentReport:
         agent_context, omitted_file_count = context_for_agent(self._stage, context)
         raw_output = await self._gateway.generate(system_prompt=self._system_prompt, input_json=serialize_context(agent_context))
-        try:
-            payload = json.loads(raw_output)
-        except (json.JSONDecodeError, ValidationError) as error:
-            raise AgentProtocolError(f"{self._stage} response is not a valid AgentDraft: {error}") from error
-        if not isinstance(payload, dict):
-            raise AgentProtocolError(f"{self._stage} response must be a JSON object, received {type(payload).__name__}")
+        payload = _parse_agent_json(raw_output, self._stage)
         required_fields = ("stage", "summary", "findings", "limitations")
         missing_fields = [field for field in required_fields if field not in payload]
         if missing_fields:
