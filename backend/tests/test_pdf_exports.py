@@ -6,9 +6,11 @@ from zipfile import ZipFile
 from fastapi import HTTPException
 
 from main import (
+    AuditPdfArchiveRequest,
     LegalArtifactRequest,
     StagePdfRequest,
     _legal_artifact_files,
+    download_audit_pdf_archive,
     download_legal_artifacts,
     download_legal_pdf,
     download_performance_pdf,
@@ -66,6 +68,33 @@ async def response_bytes(response) -> bytes:
 
 
 class PdfExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complete_audit_archive_contains_three_real_pdfs(self) -> None:
+        response = await download_audit_pdf_archive(
+            AuditPdfArchiveRequest(
+                performance=report_for(Stage.PERFORMANCE),
+                security=report_for(Stage.SECURITY),
+                legal=report_for(Stage.LEGAL),
+                jurisdictions=["KE"],
+            )
+        )
+
+        self.assertEqual(response.media_type, "application/zip")
+        self.assertEqual(response.headers["content-disposition"], "attachment; filename=scavibe-audit-reports.zip")
+        archive = ZipFile(BytesIO(await response_bytes(response)))
+        self.assertEqual(
+            archive.namelist(),
+            [
+                "scavibe-performance-audit.pdf",
+                "scavibe-security-audit.pdf",
+                "scavibe-legal-audit-and-drafts.pdf",
+            ],
+        )
+        for filename in archive.namelist():
+            document = archive.read(filename)
+            self.assertTrue(document.startswith(b"%PDF-"))
+            self.assertTrue(document.rstrip().endswith(b"%%EOF"))
+            self.assertGreater(len(document), 3_000)
+
     async def test_zero_finding_report_still_exports_a_valid_pdf(self) -> None:
         response = await download_security_pdf(StagePdfRequest(report=report_for(Stage.SECURITY, findings=[])))
         document = await response_bytes(response)

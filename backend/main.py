@@ -164,6 +164,15 @@ class StagePdfRequest(BaseModel):
     report: AgentReport
 
 
+class AuditPdfArchiveRequest(BaseModel):
+    """The three sealed stage reports required for one downloadable audit archive."""
+
+    performance: AgentReport
+    security: AgentReport
+    legal: AgentReport
+    jurisdictions: list[str]
+
+
 class RampReportRequest(BaseModel):
     ramp_report_token: str
 
@@ -632,6 +641,82 @@ async def _specialist_report(stage: Stage, context: AuditContext) -> AgentReport
     return report
 
 
+def _sse_data(event: dict) -> str:
+    return f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+
+
+def _specialist_stage_stream(stage: Stage, request: StageAuditRequest) -> StreamingResponse:
+    """Stream only factual evidence-selection and report milestones for one specialist stage."""
+    async def event_stream():
+        yield _sse_data(
+            {
+                "type": "stage_started",
+                "stage": stage.value,
+                "activity": "pinning immutable repository commit",
+            }
+        )
+        try:
+            snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
+        except HTTPException as error:
+            yield _sse_data({"type": "stage_failed", "stage": stage.value, "detail": str(error.detail)})
+            return
+        yield _sse_data(
+            {
+                "type": "evidence_selected",
+                "stage": stage.value,
+                "commit_sha": snapshot.context.commit_sha,
+                "selected_file_count": len(snapshot.selected_paths),
+                "repository_path_count": len(snapshot.context.repository_paths),
+                "source_content_complete": snapshot.source_content_complete,
+            }
+        )
+        activity = "OWASP evidence input queued" if stage == Stage.SECURITY else "data-handling evidence input queued"
+        selected_total = len(snapshot.selected_paths)
+        for index, path in enumerate(snapshot.selected_paths, start=1):
+            yield _sse_data(
+                {
+                    "type": "file_queued",
+                    "stage": stage.value,
+                    "file_path": path,
+                    "index": index,
+                    "total": selected_total,
+                    "activity": activity,
+                }
+            )
+        yield _sse_data(
+            {
+                "type": "analysis_started",
+                "stage": stage.value,
+                "activity": "validating evidence-backed specialist findings",
+            }
+        )
+        try:
+            report = await _specialist_report(stage, snapshot.context)
+        except HTTPException as error:
+            yield _sse_data({"type": "stage_failed", "stage": stage.value, "detail": str(error.detail)})
+            return
+        result = StageAuditResponse(
+            stage=stage,
+            audit_id=audit_id,
+            audit_pin=audit_pin,
+            repository=_repository_summary(snapshot),
+            report=report,
+        )
+        yield _sse_data(
+            {
+                "type": "report_ready",
+                "stage": stage.value,
+                "result": result.model_dump(mode="json"),
+            }
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/audit-stages/performance", response_model=StageAuditResponse)
 async def audit_performance(request: StageAuditRequest) -> StageAuditResponse:
     if request.sandbox_url is None or request.sandbox_authorized is not True:
@@ -775,6 +860,11 @@ async def audit_security(request: StageAuditRequest) -> StageAuditResponse:
     return StageAuditResponse(stage=Stage.SECURITY, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
 
 
+@app.post("/audit-stages/security/stream")
+async def audit_security_stream(request: StageAuditRequest) -> StreamingResponse:
+    return _specialist_stage_stream(Stage.SECURITY, request)
+
+
 @app.post("/audit-stages/legal", response_model=StageAuditResponse)
 async def audit_legal(request: StageAuditRequest) -> StageAuditResponse:
     if not request.jurisdictions:
@@ -782,6 +872,13 @@ async def audit_legal(request: StageAuditRequest) -> StageAuditResponse:
     snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
     report = await _specialist_report(Stage.LEGAL, snapshot.context)
     return StageAuditResponse(stage=Stage.LEGAL, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
+
+
+@app.post("/audit-stages/legal/stream")
+async def audit_legal_stream(request: StageAuditRequest) -> StreamingResponse:
+    if not request.jurisdictions:
+        raise HTTPException(status_code=422, detail="legal requires at least one explicit jurisdiction code")
+    return _specialist_stage_stream(Stage.LEGAL, request)
 
 
 def _legal_artifact_files(report: AgentReport, jurisdictions: list[str]) -> dict[str, str]:
@@ -969,6 +1066,41 @@ async def download_legal_pdf(request: LegalArtifactRequest) -> StreamingResponse
             legal_drafts=(artifacts["DRAFT_PRIVACY_POLICY.md"], artifacts["DRAFT_TERMS_OF_SERVICE.md"]),
         ),
         "scavibe-legal-audit-and-drafts.pdf",
+    )
+
+
+@app.post("/audit-stages/pdf-archive")
+async def download_audit_pdf_archive(request: AuditPdfArchiveRequest) -> StreamingResponse:
+    """Return the three real stage PDFs in one browser-safe download."""
+    _require_pdf_stage(request.performance, Stage.PERFORMANCE)
+    _require_pdf_stage(request.security, Stage.SECURITY)
+    _require_pdf_stage(request.legal, Stage.LEGAL)
+    legal_artifacts = _legal_artifact_files(request.legal, request.jurisdictions)
+    archive = BytesIO()
+    with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            "scavibe-performance-audit.pdf",
+            _stage_pdf_bytes(request.performance),
+        )
+        zip_file.writestr(
+            "scavibe-security-audit.pdf",
+            _stage_pdf_bytes(request.security),
+        )
+        zip_file.writestr(
+            "scavibe-legal-audit-and-drafts.pdf",
+            _stage_pdf_bytes(
+                request.legal,
+                legal_drafts=(
+                    legal_artifacts["DRAFT_PRIVACY_POLICY.md"],
+                    legal_artifacts["DRAFT_TERMS_OF_SERVICE.md"],
+                ),
+            ),
+        )
+    archive.seek(0)
+    return StreamingResponse(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=scavibe-audit-reports.zip"},
     )
 
 

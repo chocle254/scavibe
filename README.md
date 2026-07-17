@@ -25,7 +25,7 @@ GitHub repo URL + Deployed app URL
 ┌─────────────────────────┐
 │   STAGE 1: PERFORMANCE   │  Deploys a disposable sandbox copy of your app
 │                          │  Ramps simulated concurrent users to find the
-│                          │  actual breaking point (10 → 100 → 1,000+)
+│                          │  actual breaking point (10 → 25 → ... → 200)
 │                          │  Reports response times, error rates, fixes
 └────────────┬─────────────┘
              │ (asks permission before any change)
@@ -49,13 +49,42 @@ GitHub repo URL + Deployed app URL
    Full report + any pull requests opened on your repo
 ```
 
-All proposed changes ship as **pull requests**, never direct pushes — you stay in control of what actually merges.
+Scavibe can create an explicitly approved **draft artifact pull request**, never
+a direct push. The implemented PR contains the evidence-backed report and,
+for Legal, the generated working drafts. It does not modify application source
+code. Source remediation patches require a separate reviewed patch workflow.
 
 ---
 
 ## Why Sandbox Load Testing?
 
 Running a load test directly against a live production URL can look identical to a denial-of-service attack to a hosting provider, and can generate unexpected billing on the user's own infrastructure. Scavibe defaults to deploying a temporary, disposable copy of the app and testing against that instead. Users can opt into testing their live URL directly, but only after an explicit warning and confirmation.
+
+---
+
+## Operational Scope and Report Downloads
+
+The performance ramp is fixed at nine exploratory steps: "10, 25, 50, 75,
+100, 125, 150, 175, 200" concurrent users. Each exploratory step lasts
+exactly 12 seconds. Scavibe then confirms the first breach, or the 200-user
+no-breach result, for exactly 60 seconds. A performance finding requires all
+three qualifying measurements: at least 100 concurrent users, at least 60
+seconds, and at least 20 completed samples. The thresholds are p95 latency
+above 500 ms or error rate above 1.0%.
+
+Each completed stage exports an actual PDF. Once all three stages finish, the
+dashboard downloads one "scavibe-audit-reports.zip" archive containing:
+
+- scavibe-performance-audit.pdf
+- scavibe-security-audit.pdf
+- scavibe-legal-audit-and-drafts.pdf
+
+Repository intake can select at most 120 supported text files, each no larger
+than 131,072 bytes, with a total source-content cap of 2,097,152 bytes. A
+specialist model receives at most 60 complete source files and 280,000
+serialized JSON characters. The UI displays the selected-file count against
+the repository manifest count. When any cap applies, the report explicitly
+states that it cannot prove repository-wide absence of a problem.
 
 ---
 
@@ -104,10 +133,10 @@ Any legal documents (Terms & Conditions, Privacy Policy, consent components) gen
 | Frontend | Next.js 14 (App Router) + Tailwind CSS, deployed to Vercel |
 | Backend | FastAPI (Python), async background tasks, deployed to Railway |
 | LLM | NVIDIA NIM `nvidia/llama-3.3-nemotron-super-49b-v1` free trial endpoint — powers all three agent stages |
-| Load testing | Locust / k6, driven programmatically against a sandbox deployment |
+| Load testing | Async HTTPX bounded GET ramp against an authorized sandbox deployment |
 | GitHub integration | GitHub API — reads repos, opens pull requests |
-| Storage | Vercel Blob — reports and generated artifacts |
-| Real-time updates | Server-Sent Events — live pipeline progress |
+| Storage | PDFs are generated per request; the backend does not claim persistent report storage |
+| Real-time updates | Server-Sent Events for the ramp and specialist-stage evidence milestones |
 
 ---
 
