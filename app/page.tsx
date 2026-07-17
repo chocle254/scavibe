@@ -261,6 +261,22 @@ function StageScene({ stage, users, result, running }: { stage: Stage; users: nu
 }
 
 function ReportPanel({ result, stage }: { result?: StageResult; stage: Stage }) {
-  if (!result) return <aside className="report-panel empty"><span className="eyebrow">Awaiting evidence</span><h2>{stage === "performance" ? "The sandbox controls are ready." : stage === "security" ? "The code review is ready." : "The data review is ready."}</h2><p>{stage === "performance" ? "Set the exact concurrent-user count, then launch a bounded test against the sandbox URL you authorized." : "Run this stage to fetch the current GitHub commit and produce a report only from supplied source evidence."}</p><div className="empty-steps"><span>01 Pin commit</span><span>02 Inspect evidence</span><span>03 Issue report</span></div></aside>;
+  if (!result) return <aside className="report-panel empty"><AuditConsole stage={stage} /></aside>;
   return <aside className="report-panel"><div className="report-top"><span className="eyebrow">Stage report</span><b>{result.report.findings.length} finding{result.report.findings.length === 1 ? "" : "s"}</b></div>{result.measurement && <div className="metric-grid"><div><span>P95</span><strong>{result.measurement.p95_latency_ms}<small>ms</small></strong></div><div><span>Error rate</span><strong>{result.measurement.error_rate_percent}<small>%</small></strong></div><div><span>Requests</span><strong>{(result.successful_requests || 0) + (result.failed_requests || 0)}</strong></div></div>}<p className="report-summary">{result.report.summary}</p><div className="findings">{result.report.findings.length === 0 && <p className="no-findings"><Icon name="check" /> No configured threshold breach was found in this stage’s evidence.</p>}{result.report.findings.map((finding) => <article key={finding.title} className={`finding ${finding.severity}`}><div><span>{finding.severity}</span><b>{finding.risk_score}/100</b></div><h3>{finding.title}</h3><p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p></article>)}</div><details><summary>Evidence and limitations</summary><ul>{result.report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></aside>;
+}
+
+function AuditConsole({ stage }: { stage: Stage }) {
+  const process = stage === "performance"
+    ? ["verify authorized sandbox target", "pin the submitted Git commit", "send bounded GET load to sandbox root", "calculate p95 latency and error rate", "validate qualifying measurement and issue verdict"]
+    : stage === "security"
+      ? ["request the current Git commit", "select security-relevant source files", "trace authentication, authorization, input, and secret paths", "validate each cited source line and exploit path", "score verified findings and issue verdict"]
+      : ["request the current Git commit", "select data-handling and policy-relevant source files", "trace collection, storage, transfer, and SDK calls", "validate each cited source line against supplied jurisdictions", "assemble the evidence-backed legal review verdict"];
+
+  return <div className="audit-console" aria-label={`${stage} audit process preview`}>
+    <div className="console-top"><span><i /> SCAVIBE / {stage.toUpperCase()}</span><b>PROCESS QUEUED</b></div>
+    <p className="console-command">$ scavibe audit --stage {stage} --evidence-only</p>
+    <div className="console-lines">{process.map((item, index) => <p key={item} style={{ animationDelay: `${index * 140}ms` }}><span>{String(index + 1).padStart(2, "0")}</span><i>›</i>{item}</p>)}</div>
+    <div className="console-file"><span>FILES</span><code>Selected after the repository commit is fetched.</code></div>
+    <p className="console-note">The terminal lists the exact process. File names appear only after Scavibe receives the backend’s selected-file evidence.</p>
+  </div>
 }
