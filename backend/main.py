@@ -7,6 +7,8 @@ kept behind explicit integrations so no live target is ever tested by default.
 
 import os
 import hmac
+import asyncio
+import json
 from base64 import b64encode
 from datetime import datetime, timezone
 from io import BytesIO
@@ -19,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 import httpx
 
-from scavibe.agents import AuditOrchestrator, NvidiaNimGateway, NvidiaNimSettings, SpecialistAgent
+from scavibe.agents import AgentProtocolError, AuditOrchestrator, NvidiaNimGateway, NvidiaNimSettings, SpecialistAgent
 from scavibe.contracts import (
     AgentReport,
     AuditContext,
@@ -32,7 +34,7 @@ from scavibe.contracts import (
     RuntimeMeasurement,
     Stage,
 )
-from scavibe.load_test import LoadTestError, LoadTestSummary, run_sandbox_load_test
+from scavibe.load_test import LoadTestError, LoadTestSummary, run_ramp_load_test, run_sandbox_load_test
 from scavibe.repository import (
     RepositoryIntakeError,
     RepositorySnapshot,
@@ -42,6 +44,13 @@ from scavibe.repository import (
     suggest_sandboxes,
 )
 from scavibe.scoring import confidence_score, risk_score, severity_for
+from scavibe.agents.thresholds import (
+    PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT,
+    PERFORMANCE_MIN_CONCURRENT_USERS,
+    PERFORMANCE_MIN_DURATION_SECONDS,
+    PERFORMANCE_MIN_SAMPLE_COUNT,
+    PERFORMANCE_P95_LATENCY_THRESHOLD_MS,
+)
 from scavibe.vercel_sandbox import (
     VercelSandboxError,
     VercelSandboxSettings,
@@ -400,24 +409,32 @@ def _repository_summary(snapshot: RepositorySnapshot) -> RepositoryEvidenceSumma
 def _performance_report(context: AuditContext, summary: LoadTestSummary) -> AgentReport:
     """Create a deterministic report from measured sandbox values only."""
     measurement = summary.measurement
+    if (
+        measurement.concurrent_users < PERFORMANCE_MIN_CONCURRENT_USERS
+        or measurement.duration_seconds < PERFORMANCE_MIN_DURATION_SECONDS
+        or measurement.sample_count < PERFORMANCE_MIN_SAMPLE_COUNT
+    ):
+        raise LoadTestError(
+            f"performance report requires measurement {measurement.id} to have at least {PERFORMANCE_MIN_CONCURRENT_USERS} concurrent users, {PERFORMANCE_MIN_DURATION_SECONDS} seconds, and {PERFORMANCE_MIN_SAMPLE_COUNT} samples"
+        )
     findings: list[Finding] = []
     conditions = [
         (
-            measurement.p95_latency_ms > 500,
-            "P95 latency exceeds 500 ms at the tested load",
-            f"Sandbox test {measurement.id} recorded p95 latency {measurement.p95_latency_ms} ms at {measurement.concurrent_users} concurrent users for {measurement.duration_seconds} seconds across {measurement.sample_count} samples; the threshold is 500 ms.",
+            measurement.p95_latency_ms is not None and measurement.p95_latency_ms > PERFORMANCE_P95_LATENCY_THRESHOLD_MS,
+            f"P95 latency exceeds {PERFORMANCE_P95_LATENCY_THRESHOLD_MS} ms at the tested load",
+            f"Sandbox test {measurement.id} recorded p95 latency {measurement.p95_latency_ms} ms at {measurement.concurrent_users} concurrent users for {measurement.duration_seconds} seconds across {measurement.sample_count} samples; the threshold is {PERFORMANCE_P95_LATENCY_THRESHOLD_MS} ms.",
             "p95_latency_ms",
             measurement.p95_latency_ms,
-            500.0,
+            PERFORMANCE_P95_LATENCY_THRESHOLD_MS,
             "Profile the tested route, remove the measured bottleneck, and repeat the same sandbox test before release.",
         ),
         (
-            measurement.error_rate_percent > 1.0,
-            "Error rate exceeds 1.0% at the tested load",
-            f"Sandbox test {measurement.id} recorded error rate {measurement.error_rate_percent}% at {measurement.concurrent_users} concurrent users for {measurement.duration_seconds} seconds across {measurement.sample_count} samples; the threshold is 1.0%.",
+            measurement.error_rate_percent > PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT,
+            f"Error rate exceeds {PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT}% at the tested load",
+            f"Sandbox test {measurement.id} recorded error rate {measurement.error_rate_percent}% at {measurement.concurrent_users} concurrent users for {measurement.duration_seconds} seconds across {measurement.sample_count} samples; the threshold is {PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT}%.",
             "error_rate_percent",
             measurement.error_rate_percent,
-            1.0,
+            PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT,
             "Inspect failed responses from the tested route, correct the failure path, and repeat the same sandbox test before release.",
         ),
     ]
@@ -472,6 +489,8 @@ async def _specialist_report(stage: Stage, context: AuditContext) -> AgentReport
         report = await SpecialistAgent(stage, NvidiaNimGateway(settings)).analyze(context)
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    except AgentProtocolError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
     if not context.source_content_complete:
         report.limitations.append(
             "Only the capped source-file selection was supplied to this stage; repository-wide absence claims are not valid."
@@ -492,7 +511,10 @@ async def audit_performance(request: StageAuditRequest) -> StageAuditResponse:
     except LoadTestError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     snapshot = await _repository_snapshot(request, [test_summary.measurement])
-    report = _performance_report(snapshot.context, test_summary)
+    try:
+        report = _performance_report(snapshot.context, test_summary)
+    except LoadTestError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
     return StageAuditResponse(
         stage=Stage.PERFORMANCE,
         repository=_repository_summary(snapshot),
@@ -500,6 +522,48 @@ async def audit_performance(request: StageAuditRequest) -> StageAuditResponse:
         measurement=test_summary.measurement,
         successful_requests=test_summary.successful_requests,
         failed_requests=test_summary.failed_requests,
+    )
+
+
+@app.post("/audit-stages/performance/ramp")
+async def audit_performance_ramp(request: StageAuditRequest) -> StreamingResponse:
+    """Stream exact ramp events while testing only an authorized sandbox URL."""
+    if request.sandbox_url is None or request.sandbox_authorized is not True:
+        raise HTTPException(status_code=422, detail="performance requires sandbox_url and sandbox_authorized=true; live URLs are not tested by default")
+
+    async def event_stream():
+        events: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def on_event(event: dict) -> None:
+            await events.put(event)
+
+        task = asyncio.create_task(run_ramp_load_test(sandbox_url=str(request.sandbox_url), on_event=on_event))
+        try:
+            while not task.done() or not events.empty():
+                if not events.empty():
+                    event = events.get_nowait()
+                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                    continue
+                event_waiter = asyncio.create_task(events.get())
+                completed, _ = await asyncio.wait({task, event_waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if event_waiter in completed:
+                    event = event_waiter.result()
+                else:
+                    event_waiter.cancel()
+                    await asyncio.gather(event_waiter, return_exceptions=True)
+                    await task
+                    continue
+                yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+            await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 

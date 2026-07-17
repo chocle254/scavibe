@@ -88,9 +88,10 @@ class RuntimeMeasurement(BaseModel):
     target_mode: Literal["sandbox"]
     endpoint: Annotated[str, Field(pattern=r"^/")]
     concurrent_users: Annotated[int, Field(ge=1, le=1_000)]
-    duration_seconds: Annotated[int, Field(ge=60, le=1_800)]
+    duration_seconds: Annotated[int, Field(ge=30, le=1_800)]
     sample_count: Annotated[int, Field(ge=20)]
-    p95_latency_ms: Annotated[float, Field(ge=0)]
+    successful_sample_count: Annotated[int, Field(ge=0)]
+    p95_latency_ms: Annotated[float | None, Field(default=None, ge=0)]
     error_rate_percent: Annotated[float, Field(ge=0, le=100)]
 
 

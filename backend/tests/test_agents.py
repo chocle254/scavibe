@@ -2,7 +2,11 @@ import json
 import unittest
 
 from scavibe.agents import AgentProtocolError, AuditOrchestrator, SpecialistAgent
-from scavibe.contracts import AuditContext, Stage
+from scavibe.agents.base import validate_draft
+from scavibe.agents.legal_agent import LEGAL_DISCLAIMER, validate_legal_finding
+from scavibe.agents.performance_agent import validate_performance_finding
+from scavibe.agents.security_agent import validate_security_finding
+from scavibe.contracts import AgentDraft, AuditContext, Stage
 
 
 def context() -> AuditContext:
@@ -27,6 +31,7 @@ def context() -> AuditContext:
                     "concurrent_users": 100,
                     "duration_seconds": 60,
                     "sample_count": 200,
+                    "successful_sample_count": 200,
                     "p95_latency_ms": 640,
                     "error_rate_percent": 0.4,
                 }
@@ -150,3 +155,79 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.stage for item in result.stage_results], ["performance", "security", "legal"])
         self.assertEqual([item.status for item in result.stage_results], ["completed", "completed", "completed"])
         self.assertIn("not legal advice", result.stage_results[2].report.limitations[-1])
+
+
+def source_evidence() -> dict:
+    return {
+        "kind": "source",
+        "statement": "The query contains request-derived data.",
+        "file_path": "api/users.py",
+        "start_line": 3,
+        "end_line": 3,
+        "quote": "query = \"SELECT * FROM users WHERE id = '\" + user_id + \"'\"",
+    }
+
+
+def runtime_evidence() -> dict:
+    return {
+        "kind": "runtime",
+        "statement": "Sandbox load_100 measured checkout latency.",
+        "measurement_id": "load_100",
+        "endpoint": "/checkout",
+        "metric": "p95_latency_ms",
+        "observed_value": 640,
+        "threshold": 500,
+    }
+
+
+def draft(stage: str, impact: str, attacker_access: str, evidence: dict) -> AgentDraft:
+    return AgentDraft.model_validate(
+        {
+            "stage": stage,
+            "summary": "A stage-specific validator test finding is supplied.",
+            "findings": [
+                {
+                    "title": "Stage validator rejects an unsupported policy value",
+                    "statement": "The test supplies exact evidence and an intentionally unsupported stage policy value.",
+                    "impact": impact,
+                    "attacker_access": attacker_access,
+                    "evidence": [evidence],
+                    "remediation": "Correct the stage policy value and repeat the evidence-backed analysis.",
+                }
+            ],
+            "limitations": [],
+        }
+    )
+
+
+class StageValidatorPolicyTests(unittest.TestCase):
+    def test_performance_rejects_measurement_below_shared_qualifying_gate(self) -> None:
+        original = context()
+        low_load_measurement = original.runtime_measurements[0].model_copy(update={"concurrent_users": 10})
+        low_load_context = original.model_copy(update={"runtime_measurements": [low_load_measurement]})
+        with self.assertRaises(AgentProtocolError):
+            validate_draft(
+                Stage.PERFORMANCE,
+                draft("performance", "service_unavailable", "unauthenticated_remote", runtime_evidence()),
+                low_load_context,
+                validate_performance_finding,
+            )
+
+    def test_security_rejects_none_impact(self) -> None:
+        with self.assertRaises(AgentProtocolError):
+            validate_draft(
+                Stage.SECURITY,
+                draft("security", "none", "unauthenticated_remote", source_evidence()),
+                context(),
+                validate_security_finding,
+            )
+
+    def test_legal_rejects_arbitrary_code_execution_impact(self) -> None:
+        with self.assertRaises(AgentProtocolError):
+            validate_draft(
+                Stage.LEGAL,
+                draft("legal", "arbitrary_code_execution", "local", source_evidence()),
+                context(),
+                validate_legal_finding,
+                LEGAL_DISCLAIMER,
+            )
