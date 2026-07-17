@@ -43,6 +43,9 @@ def context() -> AuditContext:
 
 
 class FakeGateway:
+    def __init__(self) -> None:
+        self._legal_calls = 0
+
     async def generate(self, *, system_prompt: str, input_json: str) -> str:
         if 'Stage must be "performance"' in system_prompt:
             return json.dumps(
@@ -107,6 +110,9 @@ class FakeGateway:
                 "limitations": ["No supplied source evidence establishes personal-data collection."],
             }
         )
+        self._legal_calls += 1
+        if self._legal_calls == 1:
+            return f"{legal_draft}\n{{}}"
         return f"```json\n{legal_draft}\n```"
 
 

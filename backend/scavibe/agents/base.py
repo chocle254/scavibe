@@ -43,6 +43,7 @@ configuration, deployment, or repository change.
 
 MAX_AGENT_INPUT_JSON_CHARACTERS = 280_000
 MAX_AGENT_SOURCE_FILES = 60
+MAX_AGENT_FORMAT_ATTEMPTS = 2
 StageValidator = Callable[[ProposedFinding, AuditContext], None]
 
 
@@ -182,12 +183,29 @@ class SpecialistAgent:
 
     async def analyze(self, context: AuditContext) -> AgentReport:
         agent_context, omitted_file_count = context_for_agent(self._stage, context)
-        raw_output = await self._gateway.generate(system_prompt=self._system_prompt, input_json=serialize_context(agent_context))
-        payload = _parse_agent_json(raw_output, self._stage)
-        required_fields = ("stage", "summary", "findings", "limitations")
-        missing_fields = [field for field in required_fields if field not in payload]
-        if missing_fields:
-            raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
+        input_json = serialize_context(agent_context)
+        payload: dict | None = None
+        format_error: AgentProtocolError | None = None
+        for attempt in range(MAX_AGENT_FORMAT_ATTEMPTS):
+            repair_instruction = "" if attempt == 0 else (
+                "\nFORMAT REPAIR: Your prior response was rejected because it was not one complete AgentDraft JSON object. "
+                "Return one JSON object only, with no Markdown fence, prose, or second JSON value."
+            )
+            raw_output = await self._gateway.generate(system_prompt=f"{self._system_prompt}{repair_instruction}", input_json=input_json)
+            try:
+                candidate = _parse_agent_json(raw_output, self._stage)
+                required_fields = ("stage", "summary", "findings", "limitations")
+                missing_fields = [field for field in required_fields if field not in candidate]
+                if missing_fields:
+                    raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
+                payload = candidate
+                break
+            except AgentProtocolError as error:
+                format_error = error
+        if payload is None:
+            raise AgentProtocolError(
+                f"{self._stage} response failed AgentDraft format validation after {MAX_AGENT_FORMAT_ATTEMPTS} attempts: {format_error}"
+            )
         try:
             draft = AgentDraft.model_validate(payload)
         except ValidationError as error:
