@@ -15,6 +15,8 @@ type Finding = {
 type Report = { stage: Stage; summary: string; findings: Finding[]; limitations: string[]; evidence_commit_sha: string };
 type StageResult = {
   stage: Stage;
+  audit_id: string;
+  audit_pin: string;
   repository: { commit_sha: string; selected_files: string[]; source_content_complete: boolean };
   report: Report;
   measurement?: { concurrent_users: number; duration_seconds: number; sample_count: number; p95_latency_ms: number; error_rate_percent: number };
@@ -80,6 +82,8 @@ export default function Home() {
   const [suggestingSandbox, setSuggestingSandbox] = useState(false);
   const [useScavibeSandbox, setUseScavibeSandbox] = useState(false);
   const [sandboxStatus, setSandboxStatus] = useState("");
+  const [auditId, setAuditId] = useState("");
+  const [auditPin, setAuditPin] = useState("");
 
   const activeResult = stage ? results[stage] : undefined;
   const payload = useMemo(() => ({
@@ -90,7 +94,9 @@ export default function Home() {
     concurrent_users: users,
     duration_seconds: duration,
     jurisdictions,
-  }), [repository, appUrl, sandboxUrl, authorized, users, duration, jurisdictions]);
+    audit_id: auditId || undefined,
+    audit_pin: auditPin || undefined,
+  }), [repository, appUrl, sandboxUrl, authorized, users, duration, jurisdictions, auditId, auditPin]);
 
   useEffect(() => {
     const value = repository.trim();
@@ -121,6 +127,8 @@ export default function Home() {
       setError("Repository URL and deployed app URL are required. Select a sandbox URL or enable the Scavibe disposable sandbox.");
       return;
     }
+    setAuditId(crypto.randomUUID());
+    setAuditPin("");
     setStage("performance");
   }
 
@@ -152,13 +160,15 @@ export default function Home() {
         setSandboxStatus("Sandbox ready. Sending bounded GET traffic, then deleting the sandbox project…");
         result = await apiRequest<StageResult>(`/sandboxes/vercel/${sandbox.deployment_id}/load-test`, {
           repository_url: repository.trim(), app_url: appUrl.trim(), ticket: sandbox.ticket,
-          concurrent_users: users, duration_seconds: duration, jurisdictions,
+          concurrent_users: users, duration_seconds: duration, jurisdictions, audit_id: auditId || undefined, audit_pin: auditPin || undefined,
         });
         setSandboxStatus(result.sandbox_teardown === "deleted" ? "Sandbox project deleted after the test." : `Sandbox teardown: ${result.sandbox_teardown || "not reported"}`);
       } else {
         result = await apiRequest<StageResult>(`/audit-stages/${stage}`, payload);
       }
       setResults((current) => ({ ...current, [stage]: result }));
+      setAuditId(result.audit_id);
+      setAuditPin(result.audit_pin);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "The audit request failed.");
     } finally { setRunning(false); }

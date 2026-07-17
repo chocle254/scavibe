@@ -31,10 +31,19 @@ from scavibe.contracts import (
     EvidenceKind,
     Finding,
     Impact,
+    RampAssessment,
     RuntimeMeasurement,
     Stage,
 )
-from scavibe.load_test import LoadTestError, LoadTestSummary, run_ramp_load_test, run_sandbox_load_test
+from scavibe.load_test import (
+    MAX_CONCURRENT_USERS,
+    MIN_CONCURRENT_USERS,
+    LoadTestError,
+    LoadTestSummary,
+    RampResult,
+    run_ramp_load_test,
+    run_sandbox_load_test,
+)
 from scavibe.repository import (
     RepositoryIntakeError,
     RepositorySnapshot,
@@ -43,6 +52,7 @@ from scavibe.repository import (
     parse_github_repository,
     suggest_sandboxes,
 )
+from scavibe.reporting import report_markdown
 from scavibe.scoring import confidence_score, risk_score, severity_for
 from scavibe.agents.thresholds import (
     PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT,
@@ -50,6 +60,13 @@ from scavibe.agents.thresholds import (
     PERFORMANCE_MIN_DURATION_SECONDS,
     PERFORMANCE_MIN_SAMPLE_COUNT,
     PERFORMANCE_P95_LATENCY_THRESHOLD_MS,
+)
+from scavibe.audit_pin import (
+    AuditPinError,
+    issue_audit_pin,
+    issue_ramp_report_token,
+    read_audit_pin,
+    read_ramp_report_token,
 )
 from scavibe.vercel_sandbox import (
     VercelSandboxError,
@@ -116,6 +133,8 @@ class StageAuditRequest(BaseModel):
     concurrent_users: int = 100
     duration_seconds: int = 60
     jurisdictions: list[str] = []
+    audit_id: str | None = None
+    audit_pin: str | None = None
 
 
 class RepositoryEvidenceSummary(BaseModel):
@@ -126,6 +145,8 @@ class RepositoryEvidenceSummary(BaseModel):
 
 class StageAuditResponse(BaseModel):
     stage: Stage
+    audit_id: str
+    audit_pin: str
     repository: RepositoryEvidenceSummary
     report: AgentReport
     measurement: RuntimeMeasurement | None = None
@@ -137,6 +158,14 @@ class StageAuditResponse(BaseModel):
 class LegalArtifactRequest(BaseModel):
     report: AgentReport
     jurisdictions: list[str]
+
+
+class StagePdfRequest(BaseModel):
+    report: AgentReport
+
+
+class RampReportRequest(BaseModel):
+    ramp_report_token: str
 
 
 class PullRequestRequest(BaseModel):
@@ -180,6 +209,8 @@ class VercelSandboxLoadTestRequest(BaseModel):
     concurrent_users: int = 100
     duration_seconds: int = 60
     jurisdictions: list[str] = []
+    audit_id: str | None = None
+    audit_pin: str | None = None
 
 
 JOBS: dict[str, AuditJob] = {}
@@ -303,10 +334,16 @@ async def test_vercel_sandbox(
         concurrent_users=request.concurrent_users,
         duration_seconds=request.duration_seconds,
         jurisdictions=request.jurisdictions,
+        audit_id=request.audit_id,
+        audit_pin=request.audit_pin,
     )
     teardown = "deleted"
     try:
-        snapshot = await _repository_snapshot(stage_request, [], commit_sha_override=sandbox.commit_sha)
+        snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(
+            stage_request,
+            [],
+            initial_commit_sha=sandbox.commit_sha,
+        )
         test_summary = await run_sandbox_load_test(
             sandbox_url=sandbox.deployment_url,
             concurrent_users=request.concurrent_users,
@@ -317,6 +354,8 @@ async def test_vercel_sandbox(
         report = _performance_report(snapshot.context, test_summary)
         result = StageAuditResponse(
             stage=Stage.PERFORMANCE,
+            audit_id=audit_id,
+            audit_pin=audit_pin,
             repository=_repository_summary(snapshot),
             report=report,
             measurement=test_summary.measurement,
@@ -383,11 +422,15 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
 
 
 async def _repository_snapshot(
-    request: StageAuditRequest, measurements: list[RuntimeMeasurement], *, commit_sha_override: str | None = None
+    request: StageAuditRequest,
+    measurements: list[RuntimeMeasurement],
+    *,
+    audit_id: str,
+    commit_sha_override: str | None = None,
 ) -> RepositorySnapshot:
     try:
         return await fetch_public_repository(
-            audit_id=f"stage_{uuid4().hex[:20]}",
+            audit_id=audit_id,
             repository_url=str(request.repository_url),
             app_url=str(request.app_url),
             jurisdictions=request.jurisdictions,
@@ -406,16 +449,109 @@ def _repository_summary(snapshot: RepositorySnapshot) -> RepositoryEvidenceSumma
     )
 
 
-def _performance_report(context: AuditContext, summary: LoadTestSummary) -> AgentReport:
+async def _pinned_repository_snapshot(
+    request: StageAuditRequest,
+    measurements: list[RuntimeMeasurement],
+    *,
+    initial_commit_sha: str | None = None,
+) -> tuple[RepositorySnapshot, str, str]:
+    """Fetch an initial commit once or reuse the client-carried signed pin."""
+    audit_id = request.audit_id or f"audit_{uuid4().hex[:20]}"
+    if request.audit_pin:
+        try:
+            pin = read_audit_pin(request.audit_pin)
+        except AuditPinError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        if pin.audit_id != audit_id:
+            raise HTTPException(status_code=422, detail="audit_pin does not match audit_id")
+        if pin.repository_url != str(request.repository_url) or pin.app_url != str(request.app_url):
+            raise HTTPException(status_code=422, detail="audit_pin does not match repository_url and app_url")
+        snapshot = await _repository_snapshot(
+            request,
+            measurements,
+            audit_id=audit_id,
+            commit_sha_override=pin.commit_sha,
+        )
+        return snapshot, audit_id, request.audit_pin
+    snapshot = await _repository_snapshot(
+        request,
+        measurements,
+        audit_id=audit_id,
+        commit_sha_override=initial_commit_sha,
+    )
+    try:
+        audit_pin = issue_audit_pin(
+            audit_id=audit_id,
+            repository_url=str(request.repository_url),
+            app_url=str(request.app_url),
+            commit_sha=snapshot.context.commit_sha,
+        )
+    except AuditPinError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return snapshot, audit_id, audit_pin
+
+
+def _ramp_assessment(result: RampResult) -> RampAssessment:
+    """Convert only the recorded ramp outcome; do not infer a breaking point."""
+    return RampAssessment(
+        tested_range=[MIN_CONCURRENT_USERS, MAX_CONCURRENT_USERS],
+        breaking_point_concurrent_users=result.breaking_point_concurrent_users,
+        metric=result.breaking_point_metric,
+        observed_value=result.breaking_point_observed_value,
+        threshold=result.breaking_point_threshold,
+    )
+
+
+def _ramp_load_test_summary(result: RampResult) -> LoadTestSummary:
+    measurement = result.confirmation_measurement
+    return LoadTestSummary(
+        measurement=measurement,
+        successful_requests=measurement.successful_sample_count,
+        failed_requests=measurement.sample_count - measurement.successful_sample_count,
+    )
+
+
+def _performance_report(
+    context: AuditContext,
+    summary: LoadTestSummary,
+    *,
+    ramp_assessment: RampAssessment | None = None,
+) -> AgentReport:
     """Create a deterministic report from measured sandbox values only."""
     measurement = summary.measurement
-    if (
+    qualifying_gate_failed = (
         measurement.concurrent_users < PERFORMANCE_MIN_CONCURRENT_USERS
         or measurement.duration_seconds < PERFORMANCE_MIN_DURATION_SECONDS
         or measurement.sample_count < PERFORMANCE_MIN_SAMPLE_COUNT
-    ):
-        raise LoadTestError(
-            f"performance report requires measurement {measurement.id} to have at least {PERFORMANCE_MIN_CONCURRENT_USERS} concurrent users, {PERFORMANCE_MIN_DURATION_SECONDS} seconds, and {PERFORMANCE_MIN_SAMPLE_COUNT} samples"
+    )
+    limitations = [
+        "This measurement covers only GET / on the supplied sandbox URL.",
+        "No conclusion is made for user counts, routes, regions, or durations that were not measured.",
+    ]
+    if qualifying_gate_failed:
+        limitations.insert(
+            0,
+            f"performance measurement did not meet the qualifying gate: at least {PERFORMANCE_MIN_CONCURRENT_USERS} concurrent users, "
+            f"{PERFORMANCE_MIN_DURATION_SECONDS}+ seconds, and {PERFORMANCE_MIN_SAMPLE_COUNT}+ samples",
+        )
+    if ramp_assessment is not None:
+        if ramp_assessment.breaking_point_concurrent_users is None:
+            limitations.append(
+                "no breaking point identified within the tested range of 10 to 200 concurrent users"
+            )
+        else:
+            limitations.append(
+                f"The first exploratory ramp breach occurred at {ramp_assessment.breaking_point_concurrent_users} concurrent users: "
+                f"{ramp_assessment.metric}={ramp_assessment.observed_value} against threshold={ramp_assessment.threshold}."
+            )
+    if qualifying_gate_failed:
+        return AgentReport(
+            stage=Stage.PERFORMANCE,
+            summary="No performance finding was generated because the supplied sandbox measurement was rejected by the qualifying gate.",
+            findings=[],
+            limitations=limitations,
+            evidence_commit_sha=context.commit_sha,
+            ramp_assessment=ramp_assessment,
         )
     findings: list[Finding] = []
     conditions = [
@@ -475,11 +611,9 @@ def _performance_report(context: AuditContext, summary: LoadTestSummary) -> Agen
         stage=Stage.PERFORMANCE,
         summary=audit_summary,
         findings=findings,
-        limitations=[
-            "This measurement covers only GET / on the supplied sandbox URL.",
-            "No conclusion is made for user counts, routes, regions, or durations that were not measured.",
-        ],
+        limitations=limitations,
         evidence_commit_sha=context.commit_sha,
+        ramp_assessment=ramp_assessment,
     )
 
 
@@ -510,13 +644,15 @@ async def audit_performance(request: StageAuditRequest) -> StageAuditResponse:
         )
     except LoadTestError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
-    snapshot = await _repository_snapshot(request, [test_summary.measurement])
+    snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [test_summary.measurement])
     try:
         report = _performance_report(snapshot.context, test_summary)
     except LoadTestError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     return StageAuditResponse(
         stage=Stage.PERFORMANCE,
+        audit_id=audit_id,
+        audit_pin=audit_pin,
         repository=_repository_summary(snapshot),
         report=report,
         measurement=test_summary.measurement,
@@ -530,9 +666,11 @@ async def audit_performance_ramp(request: StageAuditRequest) -> StreamingRespons
     """Stream exact ramp events while testing only an authorized sandbox URL."""
     if request.sandbox_url is None or request.sandbox_authorized is not True:
         raise HTTPException(status_code=422, detail="performance requires sandbox_url and sandbox_authorized=true; live URLs are not tested by default")
+    snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
 
     async def event_stream():
         events: asyncio.Queue[dict] = asyncio.Queue()
+        ramp_completed_event: dict | None = None
 
         async def on_event(event: dict) -> None:
             await events.put(event)
@@ -542,7 +680,10 @@ async def audit_performance_ramp(request: StageAuditRequest) -> StreamingRespons
             while not task.done() or not events.empty():
                 if not events.empty():
                     event = events.get_nowait()
-                    yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+                    if event["type"] == "ramp_completed":
+                        ramp_completed_event = event
+                    else:
+                        yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
                     continue
                 event_waiter = asyncio.create_task(events.get())
                 completed, _ = await asyncio.wait({task, event_waiter}, return_when=asyncio.FIRST_COMPLETED)
@@ -553,8 +694,33 @@ async def audit_performance_ramp(request: StageAuditRequest) -> StreamingRespons
                     await asyncio.gather(event_waiter, return_exceptions=True)
                     await task
                     continue
+                if event["type"] == "ramp_completed":
+                    ramp_completed_event = event
+                    continue
                 yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
-            await task
+            ramp_result = await task
+            if ramp_completed_event is None:
+                raise LoadTestError("ramp completed without a ramp_completed event")
+            summary = _ramp_load_test_summary(ramp_result)
+            snapshot.context.runtime_measurements.append(summary.measurement)
+            report = _performance_report(
+                snapshot.context,
+                summary,
+                ramp_assessment=_ramp_assessment(ramp_result),
+            )
+            ramp_report_token = issue_ramp_report_token(
+                audit_id=audit_id,
+                audit_pin=audit_pin,
+                repository=_repository_summary(snapshot).model_dump(mode="json"),
+                report=report.model_dump(mode="json"),
+                measurement=summary.measurement.model_dump(mode="json"),
+                successful_requests=summary.successful_requests,
+                failed_requests=summary.failed_requests,
+            )
+            # The SSE data object remains the specified fixed shape. The opaque
+            # SSE id carries the signed report retrieval token for POST clients.
+            yield f"id: {ramp_report_token}\n"
+            yield f"data: {json.dumps(ramp_completed_event, separators=(',', ':'))}\n\n"
         finally:
             if not task.done():
                 task.cancel()
@@ -567,83 +733,185 @@ async def audit_performance_ramp(request: StageAuditRequest) -> StreamingRespons
     )
 
 
+@app.post("/audit-stages/performance/ramp/report", response_model=StageAuditResponse)
+async def read_performance_ramp_report(request: RampReportRequest) -> StageAuditResponse:
+    """Return the report sealed into the final SSE event id without retesting."""
+    try:
+        token = read_ramp_report_token(request.ramp_report_token)
+        pin = read_audit_pin(token.audit_pin)
+        repository = RepositoryEvidenceSummary.model_validate(token.repository)
+        report = AgentReport.model_validate(token.report)
+        measurement = RuntimeMeasurement.model_validate(token.measurement)
+    except (AuditPinError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if token.audit_id != pin.audit_id:
+        raise HTTPException(status_code=422, detail="ramp_report_token audit_id does not match its audit_pin")
+    if report.stage != Stage.PERFORMANCE:
+        raise HTTPException(status_code=422, detail="ramp_report_token does not contain a performance report")
+    if report.evidence_commit_sha != pin.commit_sha or repository.commit_sha != pin.commit_sha:
+        raise HTTPException(status_code=422, detail="ramp_report_token does not match the pinned evidence commit")
+    if report.ramp_assessment is None:
+        raise HTTPException(status_code=422, detail="ramp_report_token does not contain a ramp assessment")
+    if measurement.successful_sample_count != token.successful_requests:
+        raise HTTPException(status_code=422, detail="ramp_report_token successful request count does not match its measurement")
+    if measurement.sample_count - measurement.successful_sample_count != token.failed_requests:
+        raise HTTPException(status_code=422, detail="ramp_report_token failed request count does not match its measurement")
+    return StageAuditResponse(
+        stage=Stage.PERFORMANCE,
+        audit_id=token.audit_id,
+        audit_pin=token.audit_pin,
+        repository=repository,
+        report=report,
+        measurement=measurement,
+        successful_requests=token.successful_requests,
+        failed_requests=token.failed_requests,
+    )
+
+
 @app.post("/audit-stages/security", response_model=StageAuditResponse)
 async def audit_security(request: StageAuditRequest) -> StageAuditResponse:
-    snapshot = await _repository_snapshot(request, [])
+    snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
     report = await _specialist_report(Stage.SECURITY, snapshot.context)
-    return StageAuditResponse(stage=Stage.SECURITY, repository=_repository_summary(snapshot), report=report)
+    return StageAuditResponse(stage=Stage.SECURITY, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
 
 
 @app.post("/audit-stages/legal", response_model=StageAuditResponse)
 async def audit_legal(request: StageAuditRequest) -> StageAuditResponse:
     if not request.jurisdictions:
         raise HTTPException(status_code=422, detail="legal requires at least one explicit jurisdiction code")
-    snapshot = await _repository_snapshot(request, [])
+    snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
     report = await _specialist_report(Stage.LEGAL, snapshot.context)
-    return StageAuditResponse(stage=Stage.LEGAL, repository=_repository_summary(snapshot), report=report)
-
-
-def _report_markdown(report: AgentReport) -> str:
-    lines = [f"# Scavibe {report.stage.value.title()} Audit", "", report.summary, "", "## Findings", ""]
-    if not report.findings:
-        lines.extend(["No evidence-backed findings were returned for the supplied evidence set.", ""])
-    for finding in report.findings:
-        lines.extend(
-            [
-                f"### {finding.severity.value.upper()} · {finding.title}",
-                "",
-                f"Risk score: {finding.risk_score}/100 · Confidence: {finding.confidence_score}/100",
-                "",
-                finding.statement,
-                "",
-                "**Required change**",
-                "",
-                finding.remediation,
-                "",
-                "**Evidence**",
-            ]
-        )
-        for evidence in finding.evidence:
-            if evidence.kind == EvidenceKind.SOURCE:
-                lines.append(f"- `{evidence.file_path}` lines {evidence.start_line}-{evidence.end_line}: `{evidence.quote}`")
-            elif evidence.kind == EvidenceKind.RUNTIME:
-                lines.append(f"- Sandbox `{evidence.measurement_id}` at `{evidence.endpoint}`: {evidence.metric}={evidence.observed_value}, threshold={evidence.threshold}")
-            else:
-                lines.append(f"- Manifest path: `{evidence.file_path}`")
-        lines.append("")
-    lines.extend(["## Limitations", ""])
-    lines.extend(f"- {limitation}" for limitation in report.limitations)
-    lines.extend(["", f"Evidence commit: `{report.evidence_commit_sha}`", ""])
-    return "\n".join(lines)
+    return StageAuditResponse(stage=Stage.LEGAL, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
 
 
 def _legal_artifact_files(report: AgentReport, jurisdictions: list[str]) -> dict[str, str]:
-    jurisdiction_label = ", ".join(jurisdictions)
+    jurisdiction_label = ", ".join(jurisdictions) or "No jurisdiction supplied"
+    finding_rows = "\n".join(
+        f"- **{finding.severity.value.upper()}** — {finding.title}: {finding.remediation}"
+        for finding in report.findings
+    ) or "- No evidence-backed legal findings were returned. This is not a compliance determination."
     return {
-        "SCAVIBE_LEGAL_REVIEW.md": _report_markdown(report),
+        "README.md": (
+            "# Scavibe legal review pack\n\n"
+            "This pack is an AI-generated working draft built from the supplied repository evidence and the listed jurisdictions. "
+            "It is not legal advice, it does not establish compliance, and it must be reviewed by a qualified lawyer before publication.\n\n"
+            "## Included files\n\n"
+            "- `SCAVIBE_LEGAL_REVIEW.md` — evidence-backed audit report.\n"
+            "- `DRAFT_PRIVACY_POLICY.md` — publication draft with completion fields.\n"
+            "- `DRAFT_TERMS_OF_SERVICE.md` — publication draft with completion fields.\n"
+            "- `DATA_PROCESSING_INVENTORY.md` — evidence and completion inventory.\n"
+            "- `IMPLEMENTATION_CHECKLIST.md` — product implementation tasks.\n"
+            "- `ConsentCheckbox.tsx` — styled React consent component.\n\n"
+            "## Required completion rule\n\n"
+            "Replace every `[VERIFY: ...]` field using verified product, entity, data-flow, and legal-review information. Do not publish a draft with unresolved completion fields.\n"
+        ),
+        "SCAVIBE_LEGAL_REVIEW.md": report_markdown(report),
         "DRAFT_PRIVACY_POLICY.md": (
             "# Draft Privacy Policy\n\n"
-            "Status: AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
-            f"Target jurisdictions supplied for review: {jurisdiction_label}.\n\n"
-            "## Information we collect\n[REPLACE WITH VERIFIED DATA-COLLECTION INVENTORY]\n\n"
-            "## How we use information\n[REPLACE WITH VERIFIED PURPOSES]\n\n"
-            "## Sharing and processors\n[REPLACE WITH VERIFIED VENDORS AND TRANSFERS]\n\n"
-            "## Retention and deletion\n[REPLACE WITH VERIFIED RETENTION PERIODS AND REQUEST PROCESS]\n"
+            "**Status:** AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
+            f"**Jurisdictions supplied for review:** {jurisdiction_label}.\n\n"
+            "## 1. Who operates this service\n\n"
+            "[VERIFY: legal entity name, trading name, physical address, and privacy contact email.]\n\n"
+            "## 2. Scope of this notice\n\n"
+            "This notice must describe the information practices of [VERIFY: product name and domains/apps covered]. It must be published where users can access it before submitting personal information.\n\n"
+            "## 3. Information inventory\n\n"
+            "| Category | Source | Purpose | Required or optional | Evidence / owner |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| [VERIFY: account data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n"
+            "| [VERIFY: device or usage data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n"
+            "| [VERIFY: payment/support data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n\n"
+            "## 4. How information is used\n\n"
+            "[VERIFY: list each processing purpose supported by the completed inventory. Do not describe a purpose that is not actually implemented.]\n\n"
+            "## 5. Sharing, processors, and transfers\n\n"
+            "[VERIFY: list every service provider, analytics provider, hosting provider, payment provider, and transfer destination. State the operational role and contractual status for each.]\n\n"
+            "## 6. Retention and deletion\n\n"
+            "[VERIFY: retention period or objective retention rule for every information category, deletion method, backup treatment, and account-closure process.]\n\n"
+            "## 7. Security and access controls\n\n"
+            "[VERIFY: state only implemented technical and organizational controls. Do not promise absolute security or controls that have not been verified.]\n\n"
+            "## 8. User requests and contact\n\n"
+            "[VERIFY: request channel, identity-verification process, escalation route, and response workflow for each supplied jurisdiction.]\n\n"
+            "## 9. Children and age gating\n\n"
+            "[VERIFY: applicable age rule, age-screen behavior, parental-consent flow if applicable, and deletion/escalation procedure. Do not publish a numeric age without legal review for the supplied jurisdictions.]\n\n"
+            "## 10. Changes to this notice\n\n"
+            "[VERIFY: effective-date process, material-change notice method, and archive location for prior versions.]\n"
         ),
         "DRAFT_TERMS_OF_SERVICE.md": (
             "# Draft Terms of Service\n\n"
-            "Status: AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
-            "## Acceptance of terms\n[REPLACE WITH YOUR PRODUCT AND LEGAL ENTITY DETAILS]\n\n"
-            "## Account responsibilities\n[REPLACE WITH VERIFIED ACCOUNT RULES]\n\n"
-            "## Acceptable use\n[REPLACE WITH PRODUCT-SPECIFIC RESTRICTIONS]\n\n"
-            "## Contact\n[REPLACE WITH LEGAL CONTACT DETAILS]\n"
+            "**Status:** AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
+            "## 1. Agreement and service operator\n\n"
+            "[VERIFY: product name, legal entity, contact address, effective date, and acceptance event.]\n\n"
+            "## 2. Eligibility and accounts\n\n"
+            "[VERIFY: eligibility requirements, age-screen behavior, account-registration data, credential responsibilities, and account suspension/deletion process.]\n\n"
+            "## 3. Permitted use\n\n"
+            "[VERIFY: product-specific permitted use, technical limits, and user-content rules.]\n\n"
+            "## 4. Prohibited conduct\n\n"
+            "[VERIFY: prohibited use categories that are appropriate for this product, including security abuse, impersonation, unlawful content, and interference with service operation.]\n\n"
+            "## 5. Fees, subscriptions, and refunds\n\n"
+            "[VERIFY: whether payments exist. If they do, specify pricing display, renewal, cancellation, refund, tax, and payment-processor terms.]\n\n"
+            "## 6. Intellectual property and user content\n\n"
+            "[VERIFY: ownership, permitted license, user-content license if applicable, takedown process, and third-party material rules.]\n\n"
+            "## 7. Service availability and changes\n\n"
+            "[VERIFY: maintenance, change-notice, support, and discontinuation commitments. Do not promise uptime levels that have not been adopted operationally.]\n\n"
+            "## 8. Disclaimers, liability, and dispute terms\n\n"
+            "[VERIFY WITH COUNSEL: jurisdiction-specific disclaimer, liability, indemnity, governing-law, venue, and dispute-resolution language.]\n\n"
+            "## 9. Contact\n\n"
+            "[VERIFY: legal and support contact details.]\n"
+        ),
+        "DATA_PROCESSING_INVENTORY.md": (
+            "# Data Processing Inventory\n\n"
+            f"**Supplied jurisdictions:** {jurisdiction_label}\n\n"
+            "## Evidence-backed audit outcomes\n\n"
+            f"{finding_rows}\n\n"
+            "## Completion inventory\n\n"
+            "| Data element | Collection point | Storage location | Processor | Purpose | Retention rule | Owner | Verification status |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n"
+            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n"
+            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n\n"
+            "## Required review questions\n\n"
+            "1. Does each collected field have an evidence-backed purpose?\n"
+            "2. Is each processor and transfer destination listed?\n"
+            "3. Does each field have a verified retention rule and owner?\n"
+            "4. Does the completed privacy notice match this inventory exactly?\n"
+        ),
+        "IMPLEMENTATION_CHECKLIST.md": (
+            "# Legal and Privacy Implementation Checklist\n\n"
+            "## Before publication\n\n"
+            "- [ ] Replace every `[VERIFY: ...]` completion field in the drafts.\n"
+            "- [ ] Confirm the policy inventory against the deployed product and every processor.\n"
+            "- [ ] Obtain qualified legal review for the supplied jurisdictions.\n"
+            "- [ ] Publish the approved Privacy Policy and Terms at stable URLs.\n"
+            "- [ ] Link both documents from signup, checkout, account, and footer surfaces that exist in the product.\n"
+            "- [ ] Store a version identifier and acceptance timestamp when terms acceptance is required.\n"
+            "- [ ] Implement age screening only after the applicable rule and flow are verified.\n"
+            "- [ ] Test request, deletion, export, and support workflows that the completed policy promises.\n\n"
+            "## Engineering evidence to retain\n\n"
+            "- [ ] Commit SHA reviewed by Scavibe.\n"
+            "- [ ] Approved policy and terms version IDs.\n"
+            "- [ ] Processor and data-flow inventory.\n"
+            "- [ ] Consent and acceptance event schema.\n"
+            "- [ ] Legal-review approval record.\n"
         ),
         "ConsentCheckbox.tsx": (
-            "export function TermsConsent() {\n"
+            "type TermsConsentProps = {\n"
+            "  privacyPolicyUrl: string;\n"
+            "  termsUrl: string;\n"
+            "  onAcceptanceChange?: (accepted: boolean) => void;\n"
+            "};\n\n"
+            "export function TermsConsent({ privacyPolicyUrl, termsUrl, onAcceptanceChange }: TermsConsentProps) {\n"
             "  return (\n"
-            "    <label>\n"
-            "      <input type=\"checkbox\" name=\"termsAccepted\" required />\n"
-            "      I confirm I meet the applicable minimum age and have read the Terms of Service and Privacy Policy.\n"
+            "    <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 14, lineHeight: 1.5 }}>\n"
+            "      <input\n"
+            "        type=\"checkbox\"\n"
+            "        name=\"termsAccepted\"\n"
+            "        required\n"
+            "        onChange={(event) => onAcceptanceChange?.(event.target.checked)}\n"
+            "      />\n"
+            "      <span>\n"
+            "        I confirm that I meet the applicable eligibility requirements and have read the{' '}\n"
+            "        <a href={termsUrl} target=\"_blank\" rel=\"noreferrer\">Terms of Service</a>{' '}and{' '}\n"
+            "        <a href={privacyPolicyUrl} target=\"_blank\" rel=\"noreferrer\">Privacy Policy</a>.\n"
+            "      </span>\n"
             "    </label>\n"
             "  );\n"
             "}\n"
@@ -651,17 +919,70 @@ def _legal_artifact_files(report: AgentReport, jurisdictions: list[str]) -> dict
     }
 
 
+def _pdf_response(pdf: bytes, filename: str) -> StreamingResponse:
+    document = BytesIO(pdf)
+    document.seek(0)
+    return StreamingResponse(
+        document,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+def _stage_pdf_bytes(report: AgentReport, *, legal_drafts: tuple[str, str] | None = None) -> bytes:
+    try:
+        from scavibe.pdf_reports import PdfGenerationError, build_stage_pdf
+    except ModuleNotFoundError as error:
+        if error.name in {"reportlab", "PIL"}:
+            raise HTTPException(status_code=503, detail="reportlab==5.0.0 and pillow==12.3.0 are required for PDF exports") from error
+        raise
+    try:
+        return build_stage_pdf(report, legal_drafts=legal_drafts)
+    except PdfGenerationError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+def _require_pdf_stage(report: AgentReport, expected_stage: Stage) -> None:
+    if report.stage != expected_stage:
+        raise HTTPException(status_code=422, detail=f"{expected_stage.value} PDF endpoint requires a {expected_stage.value} report")
+
+
+@app.post("/audit-stages/performance/pdf")
+async def download_performance_pdf(request: StagePdfRequest) -> StreamingResponse:
+    _require_pdf_stage(request.report, Stage.PERFORMANCE)
+    return _pdf_response(_stage_pdf_bytes(request.report), "scavibe-performance-audit.pdf")
+
+
+@app.post("/audit-stages/security/pdf")
+async def download_security_pdf(request: StagePdfRequest) -> StreamingResponse:
+    _require_pdf_stage(request.report, Stage.SECURITY)
+    return _pdf_response(_stage_pdf_bytes(request.report), "scavibe-security-audit.pdf")
+
+
+@app.post("/audit-stages/legal/pdf")
+async def download_legal_pdf(request: LegalArtifactRequest) -> StreamingResponse:
+    _require_pdf_stage(request.report, Stage.LEGAL)
+    artifacts = _legal_artifact_files(request.report, request.jurisdictions)
+    return _pdf_response(
+        _stage_pdf_bytes(
+            request.report,
+            legal_drafts=(artifacts["DRAFT_PRIVACY_POLICY.md"], artifacts["DRAFT_TERMS_OF_SERVICE.md"]),
+        ),
+        "scavibe-legal-audit-and-drafts.pdf",
+    )
+
+
 @app.post("/audit-stages/legal-artifacts")
 async def download_legal_artifacts(request: LegalArtifactRequest) -> StreamingResponse:
+    _require_pdf_stage(request.report, Stage.LEGAL)
     archive = BytesIO()
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
-        for path, content in _legal_artifact_files(request.report, request.jurisdictions).items():
-            zip_file.writestr(path, content)
+        zip_file.writestr("ConsentCheckbox.tsx", _legal_artifact_files(request.report, request.jurisdictions)["ConsentCheckbox.tsx"])
     archive.seek(0)
     return StreamingResponse(
         archive,
         media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=scavibe-legal-drafts.zip"},
+        headers={"Content-Disposition": "attachment; filename=scavibe-consent-component.zip"},
     )
 
 
@@ -697,7 +1018,7 @@ async def create_document_pull_request(request: PullRequestRequest) -> PullReque
             raise HTTPException(status_code=502, detail=f"GitHub branch creation returned HTTP {branch_response.status_code}")
         files = {f"scavibe-audit/{path}": content for path, content in _legal_artifact_files(request.report, request.jurisdictions).items()}
         if request.report.stage != Stage.LEGAL:
-            files = {"scavibe-audit/SCAVIBE_AUDIT_REPORT.md": _report_markdown(request.report)}
+            files = {"scavibe-audit/SCAVIBE_AUDIT_REPORT.md": report_markdown(request.report)}
         for path, content in files.items():
             content_response = await client.put(
                 f"https://api.github.com/repos/{owner}/{repository}/contents/{path}",

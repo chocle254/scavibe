@@ -68,6 +68,7 @@ class RampLoadTestTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(exploratory_completed[0]["p95_latency_ms"])
         self.assertEqual(exploratory_completed[0]["error_rate_percent"], 100.0)
         self.assertEqual(len(result.exploratory_steps), 1)
+        self.assertTrue(all(not isinstance(step, RuntimeMeasurement) for step in result.exploratory_steps))
         self.assertIsInstance(result.confirmation_measurement, RuntimeMeasurement)
         self.assertGreaterEqual(result.confirmation_measurement.sample_count, 20)
         self.assertGreaterEqual(result.confirmation_measurement.duration_seconds, 60)

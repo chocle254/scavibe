@@ -122,6 +122,9 @@ class RampResult:
     exploratory_steps: tuple[RampStepResult, ...]
     confirmation_measurement: RuntimeMeasurement
     breaking_point_concurrent_users: int | None
+    breaking_point_metric: Literal["p95_latency_ms", "error_rate_percent"] | None = None
+    breaking_point_observed_value: float | None = None
+    breaking_point_threshold: float | None = None
 
 
 async def run_sandbox_load_test(*, sandbox_url: str, concurrent_users: int, duration_seconds: int) -> LoadTestSummary:
@@ -272,6 +275,7 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
     target = validate_sandbox_url(sandbox_url)
     exploratory_steps: list[RampStepResult] = []
     candidate_step: RampStepResult | None = None
+    candidate_breach: tuple[Literal["p95_latency_ms", "error_rate_percent"], float, float] | None = None
     for step_index, concurrent_users in enumerate(RAMP_CONCURRENT_USERS):
         await on_event(
             {
@@ -320,6 +324,7 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
                 }
             )
             candidate_step = step
+            candidate_breach = (metric, observed_value, threshold)
             break
     confirmation_step = candidate_step or exploratory_steps[-1]
     await on_event(
@@ -378,4 +383,7 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
         exploratory_steps=tuple(exploratory_steps),
         confirmation_measurement=measurement,
         breaking_point_concurrent_users=candidate_step.concurrent_users if candidate_step else None,
+        breaking_point_metric=candidate_breach[0] if candidate_breach else None,
+        breaking_point_observed_value=candidate_breach[1] if candidate_breach else None,
+        breaking_point_threshold=candidate_breach[2] if candidate_breach else None,
     )

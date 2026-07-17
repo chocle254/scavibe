@@ -6,6 +6,7 @@ measured sandbox endpoint. This rule prevents impression-based findings.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Literal
 
@@ -145,12 +146,33 @@ class Finding(ProposedFinding):
     confidence_score: Annotated[int, Field(ge=0, le=100)]
 
 
+class RampAssessment(BaseModel):
+    """The measured outcome of the fixed nine-step sandbox ramp."""
+
+    tested_range: Annotated[list[int], Field(min_length=2, max_length=2)]
+    breaking_point_concurrent_users: Annotated[int | None, Field(default=None, ge=1, le=1_000)]
+    metric: Literal["p95_latency_ms", "error_rate_percent"] | None = None
+    observed_value: Annotated[float | None, Field(default=None, ge=0)]
+    threshold: Annotated[float | None, Field(default=None, ge=0)]
+
+    @model_validator(mode="after")
+    def require_complete_breaking_point_details(self) -> "RampAssessment":
+        details = (self.metric, self.observed_value, self.threshold)
+        if self.breaking_point_concurrent_users is None and any(value is not None for value in details):
+            raise ValueError("ramp assessment without a breaking point cannot include breach details")
+        if self.breaking_point_concurrent_users is not None and any(value is None for value in details):
+            raise ValueError("ramp assessment with a breaking point requires metric, observed_value, and threshold")
+        return self
+
+
 class AgentReport(BaseModel):
     stage: Stage
     summary: str
     findings: list[Finding]
     limitations: list[str]
     evidence_commit_sha: str
+    ramp_assessment: RampAssessment | None = None
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StageResult(BaseModel):
