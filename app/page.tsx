@@ -222,7 +222,40 @@ export default function Home() {
 }
 
 function StageScene({ stage, users, result, running }: { stage: Stage; users: number; result?: StageResult; running: boolean }) {
-  if (stage === "performance") return <div className="stage-scene performance-scene"><div className="traffic-caption"><span>Test load</span><b>{users} users</b></div><div className="traffic-lines">{[0, 1, 2].map((line) => <div className={`traffic-line ${running ? "running" : ""}`} key={line}><span>{line === 0 ? "10" : line === 1 ? "100" : users}</span><div>{Array.from({ length: 7 }).map((_, index) => <i key={index} style={{ animationDelay: `${-(index * 0.24 + line * 0.1)}s` }} />)}</div>{result?.measurement && <b>{line === 2 ? `${result.measurement.p95_latency_ms}ms p95` : line === 1 ? `${result.measurement.error_rate_percent}% errors` : "baseline"}</b>}</div>)}</div><div className="wave-chart"><i /><i /><i /><i /><i /></div></div>;
+  const [progress, setProgress] = useState(result ? 100 : 0);
+
+  useEffect(() => {
+    if (!running) {
+      setProgress(result ? 100 : 0);
+      return;
+    }
+    setProgress(8);
+    const timer = window.setInterval(() => setProgress((current) => Math.min(current + 4, 90)), 800);
+    return () => window.clearInterval(timer);
+  }, [running, result]);
+
+  const progressLabel = result && !running
+    ? "Validated report ready"
+    : progress < 35
+      ? "Request accepted"
+      : progress < 75
+        ? "Evidence analysis in progress"
+        : "Validating evidence report";
+
+  return <div className={`stage-scene ${stage}-scene`}>
+    <div className="scene-progress-copy">
+      <span>{stage === "performance" ? `Testing ${users} concurrent users` : stage === "security" ? "Tracing source evidence" : "Reviewing data handling"}</span>
+      <b>{stage === "performance" && result?.measurement ? `${result.measurement.p95_latency_ms}ms p95` : stage === "security" ? "OWASP review" : "Policy review"}</b>
+    </div>
+    <div className={`scene-orbit ${running ? "moving" : ""}`}><i /><i /><i /></div>
+    <span className="scene-status">{running ? "Audit in progress" : result ? "Evidence trace complete" : "Ready to run"}</span>
+    <div className="stage-progress" aria-live="polite">
+      <div><span>{progressLabel}</span><strong>{progress}%</strong></div>
+      <div className="stage-progress-track"><i style={{ width: `${progress}%` }} /></div>
+      <small>{running ? "Progress reflects the active audit request. Completion reaches 100% only after report validation." : result ? "Evidence report validated and ready for review." : "Run this stage to begin progress tracking."}</small>
+    </div>
+  </div>;
+
   if (stage === "security") return <div className="stage-scene security-scene"><div className="code-paper">{["identity.verify(token)", "route /api/users/:id", "ownership.assert(user, id)", "input.sanitize(payload)", "database.query(statement)"].map((line, index) => <p key={line}><span>{String(index + 1).padStart(2, "0")}</span>{line}</p>)}<div className={running ? "scanline moving" : "scanline"} /></div><div className="security-orbit"><i /><i /><i /><i /></div><span className="scene-status">{running ? "Tracing evidence paths" : result ? "Evidence trace complete" : "Authentication · access · input"}</span></div>;
   return <div className="stage-scene legal-scene"><div className="paper-stack"><article><b>DATA MAP</b><i /><i /><i /></article><article><b>PRIVACY</b><i /><i /><i /><i /></article><article><b>TERMS</b><i /><i /><i /><em>{running ? "SCANNING" : result ? "REVIEW" : "READY"}</em></article></div><div className="legal-orbit"><i /><i /><i /></div><span className="scene-status">Collection · processors · consent</span></div>;
 }
