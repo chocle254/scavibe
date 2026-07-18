@@ -7,17 +7,18 @@ from fastapi import HTTPException
 
 from main import (
     AuditPdfArchiveRequest,
-    LegalArtifactRequest,
+    ConsentExampleRequest,
     StagePdfRequest,
-    _legal_artifact_files,
+    _consent_example_files,
     download_audit_pdf_archive,
-    download_legal_artifacts,
+    download_consent_example,
     download_legal_pdf,
     download_performance_pdf,
     download_security_pdf,
+    _stage_pdf_bytes,
 )
-from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceKind, Finding, Impact, Severity, Stage
-from scavibe.pdf_reports import build_stage_pdf
+from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceKind, Finding, Impact, RampAssessment, Severity, Stage
+from scavibe.pdf_reports import build_stage_pdf, generate_pdf_report
 import scavibe.pdf_reports as pdf_reports
 
 
@@ -68,13 +69,42 @@ async def response_bytes(response) -> bytes:
 
 
 class PdfExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_all_pdf_routes_share_the_single_generator(self) -> None:
+        for stage in (Stage.PERFORMANCE, Stage.SECURITY, Stage.LEGAL):
+            report = report_for(stage)
+            with patch("scavibe.pdf_reports.generate_pdf_report", return_value=b"%PDF-test\n%%EOF\n") as generate:
+                document = _stage_pdf_bytes(report)
+            self.assertEqual(document, b"%PDF-test\n%%EOF\n")
+            self.assertEqual(generate.call_args.args, (report, pdf_reports.STAGE_ACCENTS[stage], pdf_reports.STAGE_AUDIT_LABELS[stage]))
+
+    async def test_performance_pdf_uses_confirmed_ramp_metrics(self) -> None:
+        performance = report_for(Stage.PERFORMANCE).model_copy(
+            update={
+                "ramp_assessment": RampAssessment(
+                    tested_range=[10, 200],
+                    breaking_point_concurrent_users=100,
+                    metric="error_rate_percent",
+                    observed_value=4.0,
+                    threshold=1.0,
+                )
+            }
+        )
+        with patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph:
+            document = generate_pdf_report(performance, "#83f5bf", "Performance audit")
+
+        rendered_text = [call.args[0] for call in paragraph.call_args_list]
+        self.assertTrue(document.startswith(b"%PDF-"))
+        self.assertIn(
+            "Confirmed ramp breaking point: error_rate_percent=4.0 against threshold=1.0 at 100 concurrent users.",
+            rendered_text,
+        )
+
     async def test_complete_audit_archive_contains_three_real_pdfs(self) -> None:
         response = await download_audit_pdf_archive(
             AuditPdfArchiveRequest(
                 performance=report_for(Stage.PERFORMANCE),
                 security=report_for(Stage.SECURITY),
                 legal=report_for(Stage.LEGAL),
-                jurisdictions=["KE"],
             )
         )
 
@@ -86,7 +116,7 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
             [
                 "scavibe-performance-audit.pdf",
                 "scavibe-security-audit.pdf",
-                "scavibe-legal-audit-and-drafts.pdf",
+                "scavibe-data-handling-and-consent-audit.pdf",
             ],
         )
         for filename in archive.namelist():
@@ -106,12 +136,12 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
     async def test_stage_endpoints_return_structural_pdfs_with_exact_filenames(self) -> None:
         performance = await download_performance_pdf(StagePdfRequest(report=report_for(Stage.PERFORMANCE)))
         security = await download_security_pdf(StagePdfRequest(report=report_for(Stage.SECURITY)))
-        legal = await download_legal_pdf(LegalArtifactRequest(report=report_for(Stage.LEGAL), jurisdictions=["KE"]))
+        legal = await download_legal_pdf(StagePdfRequest(report=report_for(Stage.LEGAL)))
 
         for response, filename in (
             (performance, "scavibe-performance-audit.pdf"),
             (security, "scavibe-security-audit.pdf"),
-            (legal, "scavibe-legal-audit-and-drafts.pdf"),
+            (legal, "scavibe-data-handling-and-consent-audit.pdf"),
         ):
             document = await response_bytes(response)
             self.assertEqual(response.media_type, "application/pdf")
@@ -125,13 +155,13 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
             await download_security_pdf(StagePdfRequest(report=report_for(Stage.PERFORMANCE)))
         self.assertEqual(raised.exception.status_code, 422)
 
-        response = await download_legal_artifacts(LegalArtifactRequest(report=report_for(Stage.LEGAL), jurisdictions=["KE"]))
+        response = await download_consent_example(ConsentExampleRequest(report=report_for(Stage.LEGAL)))
         archive = ZipFile(BytesIO(await response_bytes(response)))
         self.assertEqual(archive.namelist(), ["ConsentCheckbox.tsx"])
-        self.assertIn("TermsConsent", archive.read("ConsentCheckbox.tsx").decode("utf-8"))
-        self.assertEqual(response.headers["content-disposition"], "attachment; filename=scavibe-consent-component.zip")
+        self.assertIn("ConsentCheckbox", archive.read("ConsentCheckbox.tsx").decode("utf-8"))
+        self.assertEqual(response.headers["content-disposition"], "attachment; filename=scavibe-consent-checkbox-example.zip")
 
-    async def test_shared_evidence_formatter_is_called_and_legal_drafts_are_passed_verbatim(self) -> None:
+    async def test_shared_evidence_formatter_is_called_and_legal_pdf_has_no_document_appendix(self) -> None:
         security = report_for(Stage.SECURITY)
         with patch("scavibe.pdf_reports.format_evidence_markdown", wraps=pdf_reports.format_evidence_markdown) as formatter:
             document = build_stage_pdf(security)
@@ -139,11 +169,8 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(formatter.call_count, len(security.findings[0].evidence))
 
         legal = report_for(Stage.LEGAL)
-        artifacts = _legal_artifact_files(legal, ["KE"])
         with patch("main._stage_pdf_bytes", return_value=b"%PDF-test\n%%EOF\n") as build_pdf:
-            response = await download_legal_pdf(LegalArtifactRequest(report=legal, jurisdictions=["KE"]))
+            response = await download_legal_pdf(StagePdfRequest(report=legal))
         self.assertEqual(response.media_type, "application/pdf")
-        self.assertEqual(
-            build_pdf.call_args.kwargs["legal_drafts"],
-            (artifacts["DRAFT_PRIVACY_POLICY.md"], artifacts["DRAFT_TERMS_OF_SERVICE.md"]),
-        )
+        self.assertEqual(build_pdf.call_args.args, (legal,))
+        self.assertEqual(_consent_example_files().keys(), {"ConsentCheckbox.tsx"})

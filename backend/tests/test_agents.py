@@ -2,8 +2,8 @@ import json
 import unittest
 
 from scavibe.agents import AgentProtocolError, AuditOrchestrator, SpecialistAgent
-from scavibe.agents.base import validate_draft
-from scavibe.agents.legal_agent import LEGAL_DISCLAIMER, validate_legal_finding
+from scavibe.agents.base import COMMON_RULES, validate_draft
+from scavibe.agents.legal_agent import LEGAL_DISCLAIMER, LEGAL_PROMPT, validate_legal_finding
 from scavibe.agents.performance_agent import validate_performance_finding
 from scavibe.agents.security_agent import validate_security_finding
 from scavibe.agents.security_agent import SECURITY_PROMPT
@@ -146,6 +146,17 @@ class InvalidQuoteGateway:
         )
 
 
+class CapturingSecurityGateway(FakeGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.input_payload: dict | None = None
+
+    async def generate(self, *, system_prompt: str, input_json: str) -> str:
+        if 'Stage must be "security"' in system_prompt:
+            self.input_payload = json.loads(input_json)
+        return await super().generate(system_prompt=system_prompt, input_json=input_json)
+
+
 class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_security_score_is_deterministic(self) -> None:
         self.assertIn('"stage", "summary", "findings", and "limitations"', SECURITY_PROMPT)
@@ -155,6 +166,33 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finding.risk_score, 80)
         self.assertEqual(finding.severity, "high")
         self.assertEqual(finding.confidence_score, 35)
+
+    async def test_security_agent_receives_no_runtime_measurements(self) -> None:
+        gateway = CapturingSecurityGateway()
+        await SpecialistAgent(Stage.SECURITY, gateway).analyze(context())
+
+        self.assertIsNotNone(gateway.input_payload)
+        self.assertNotIn("runtime_measurements", gateway.input_payload)
+        self.assertEqual(gateway.input_payload["repository_paths"], ["api/users.py", "README.md"])
+        self.assertEqual(gateway.input_payload["source_files"][0]["path"], "api/users.py")
+
+    async def test_specialist_phase_callbacks_follow_actual_analysis_then_evidence_validation(self) -> None:
+        phases: list[tuple[str, str]] = []
+
+        async def on_phase(event_type: str, phase: str) -> None:
+            phases.append((event_type, phase))
+
+        await SpecialistAgent(Stage.SECURITY, FakeGateway()).analyze(context(), on_phase=on_phase)
+
+        self.assertEqual(
+            phases,
+            [
+                ("phase_started", "specialist_analysis"),
+                ("phase_completed", "specialist_analysis"),
+                ("phase_started", "evidence_validation"),
+                ("phase_completed", "evidence_validation"),
+            ],
+        )
 
     async def test_invalid_quote_is_rejected(self) -> None:
         with self.assertRaises(AgentProtocolError):
@@ -211,6 +249,27 @@ def draft(stage: str, impact: str, attacker_access: str, evidence: dict) -> Agen
 
 
 class StageValidatorPolicyTests(unittest.TestCase):
+    def test_common_rules_require_the_exact_task_three_remediation_boundary(self) -> None:
+        self.assertIn(
+            "State the exact required fix in finding.remediation — name the specific file,\n"
+            "function, or configuration value that must change and describe the corrected\n"
+            "behavior precisely enough for an engineer to implement it without further\n"
+            "research. Never author, generate, or apply the actual code diff, configuration\n"
+            "file, or pull request yourself — describe the fix, do not write it.",
+            COMMON_RULES,
+        )
+
+    def test_legal_prompt_requires_implementable_recommendations_without_document_drafts(self) -> None:
+        self.assertIn(
+            "State finding.remediation as a specific, implementable product change tied\n"
+            "to the cited evidence — e.g. 'Add an age-confirmation checkbox to the\n"
+            "signup form at <file>:<line> before the account-creation call fires' or\n"
+            "'This app collects <specific data field, cited> with no visible privacy\n"
+            "policy link; add one before this data is collected.' Never draft the text\n"
+            "of a policy, terms of service, or any legal document — recommend that the\n"
+            "user adds one and describe the exact UI/process change needed.",
+            LEGAL_PROMPT,
+        )
     def test_performance_rejects_measurement_below_shared_qualifying_gate(self) -> None:
         original = context()
         low_load_measurement = original.runtime_measurements[0].model_copy(update={"concurrent_users": 10})

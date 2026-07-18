@@ -73,26 +73,30 @@ type RampLane = {
 };
 type Trace = { id: string; stage: Stage; text: string; kind: "info" | "success" | "warn" | "error"; at: string };
 type Coverage = { commitSha: string; selected: number; manifest: number; complete: boolean };
+type SpecialistStage = Exclude<Stage, "performance">;
+type SpecialistPhaseName = "repository_fetch" | "specialist_analysis" | "evidence_validation";
+type SpecialistPhaseState = { status: "waiting" | "running" | "completed"; activity: string };
+type SpecialistPhaseMap = Partial<Record<SpecialistStage, Partial<Record<SpecialistPhaseName, SpecialistPhaseState>>>>;
+type AutoFixType = "consent_checkbox" | "rate_limit_middleware";
+type AutoFixOffer = { fixType: AutoFixType; label: string };
 
 type RampEvent =
   | { type: "step_started"; phase: "exploratory" | "confirmation"; step_index: number; concurrent_users: number; planned_duration_seconds: number }
   | { type: "sample_tick"; step_index: number; elapsed_seconds: number; live_p95_latency_ms: number | null; live_error_rate_percent: number; samples_so_far: number }
   | { type: "step_completed"; phase: "exploratory" | "confirmation"; step_index: number; concurrent_users: number; p95_latency_ms: number | null; error_rate_percent: number; sample_count: number; breached: boolean }
   | { type: "breaking_point_found"; concurrent_users: number; metric: "p95_latency_ms" | "error_rate_percent"; observed_value: number; threshold: number }
+  | { type: "candidate_discarded" }
   | { type: "ramp_completed"; tested_range: [number, number]; breaking_point_concurrent_users: number | null };
 type SpecialistEvent =
-  | { type: "stage_started"; stage: Stage; activity: string }
-  | { type: "evidence_selected"; stage: Stage; commit_sha: string; selected_file_count: number; repository_path_count: number; source_content_complete: boolean }
-  | { type: "file_queued"; stage: Stage; file_path: string; index: number; total: number; activity: string }
-  | { type: "analysis_started"; stage: Stage; activity: string }
-  | { type: "report_ready"; stage: Stage; result: StageResult }
-  | { type: "stage_failed"; stage: Stage; detail: string };
+  | { type: "phase_started" | "phase_completed"; stage: SpecialistStage; phase: SpecialistPhaseName; activity: string; commit_sha?: string; selected_file_count?: number; repository_path_count?: number; source_content_complete?: boolean }
+  | { type: "report_ready"; stage: SpecialistStage; result: StageResult }
+  | { type: "stage_failed"; stage: SpecialistStage; detail: string };
 
 const schedule = [10, 25, 50, 75, 100, 125, 150, 175, 200];
 const stages: Array<{ id: Stage; no: string; name: string; label: string; icon: IconName }> = [
   { id: "performance", no: "01", name: "Performance", label: "Sandbox load lab", icon: "bolt" },
   { id: "security", no: "02", name: "Cybersecurity", label: "OWASP evidence review", icon: "shield" },
-  { id: "legal", no: "03", name: "Legal", label: "Data and policy review", icon: "scale" },
+  { id: "legal", no: "03", name: "Data & consent", label: "Data-handling and consent audit", icon: "scale" },
 ];
 const emptyProgress: Record<Stage, number | null> = { performance: null, security: null, legal: null };
 
@@ -164,13 +168,26 @@ function triggerDownload(blob: Blob, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
 }
 
+function autoFixOffer(stage: Stage, finding: Finding): AutoFixOffer | null {
+  const text = [finding.title, finding.statement, finding.remediation].join(" ").toLowerCase();
+  const hasSourceEvidence = finding.evidence.some((item) => item.kind === "source" && Boolean(item.file_path));
+  if (!hasSourceEvidence) return null;
+  const consentSignal = text.includes("consent") || text.includes("age-confirm") || text.includes("age confirmation");
+  const checkboxSignal = text.includes("checkbox") || text.includes("check box");
+  if (stage === "legal" && consentSignal && checkboxSignal) return { fixType: "consent_checkbox", label: "Add this checkbox for me" };
+  if ((stage === "security" || stage === "performance") && (text.includes("rate limit") || text.includes("rate-limit") || text.includes("rate limiting") || text.includes("throttl"))) {
+    return { fixType: "rate_limit_middleware", label: "Add rate limiting for me" };
+  }
+  return null;
+}
+
 export default function Home() {
   const [stage, setStage] = useState<Stage | null>(null);
   const [repository, setRepository] = useState("");
   const [appUrl, setAppUrl] = useState("");
   const [sandboxUrl, setSandboxUrl] = useState("");
   const [authorized, setAuthorized] = useState(false);
-  const [useScavibeSandbox, setUseScavibeSandbox] = useState(false);
+  const [useScavibeSandbox, setUseScavibeSandbox] = useState(true);
   const [jurisdictions, setJurisdictions] = useState<string[]>(["KE"]);
   const [auditId, setAuditId] = useState("");
   const [auditPin, setAuditPin] = useState("");
@@ -183,12 +200,14 @@ export default function Home() {
   const activeRampLaneRef = useRef<{ key: string; index: number } | null>(null);
   const [breakingPoint, setBreakingPoint] = useState<RampAssessment | null>(null);
   const [coverage, setCoverage] = useState<Partial<Record<Stage, Coverage>>>({});
-  const [queuedFiles, setQueuedFiles] = useState<Partial<Record<Stage, string[]>>>({});
+  const [specialistPhases, setSpecialistPhases] = useState<SpecialistPhaseMap>({});
   const [suggestions, setSuggestions] = useState<SandboxSuggestion[]>([]);
   const [suggesting, setSuggesting] = useState(false);
   const [sandboxStatus, setSandboxStatus] = useState("");
   const [prApproved, setPrApproved] = useState(false);
   const [prUrl, setPrUrl] = useState("");
+  const [sourceFixApproval, setSourceFixApproval] = useState<Record<string, boolean>>({});
+  const [sourceFixUrls, setSourceFixUrls] = useState<Record<string, string>>({});
 
   const activeResult = stage ? results[stage] : undefined;
   const activeMeta = stages.find((item) => item.id === stage);
@@ -234,10 +253,12 @@ export default function Home() {
     setLanes({});
     setBreakingPoint(null);
     setCoverage({});
-    setQueuedFiles({});
+    setSpecialistPhases({});
     setSandboxStatus("");
     setPrApproved(false);
     setPrUrl("");
+    setSourceFixApproval({});
+    setSourceFixUrls({});
   }
 
   function begin(event: FormEvent) {
@@ -312,8 +333,12 @@ export default function Home() {
       addTrace("performance", "First breach at " + event.concurrent_users + " users: " + event.metric + "=" + event.observed_value + ".", "warn");
       return;
     }
+    if (event.type === "candidate_discarded") {
+      addTrace("performance", "Exploratory candidate cleared by its 60-second confirmation; continuing the ramp.", "info");
+      return;
+    }
     setProgress((current) => ({ ...current, performance: 96 }));
-    addTrace("performance", event.breaking_point_concurrent_users === null ? "Ramp completed without an exploratory breaking point from 10 to 200 users." : "Ramp completed. Sealing confirmation evidence.", "success");
+    addTrace("performance", event.breaking_point_concurrent_users === null ? "Ramp completed without a confirmed breaking point from 10 to 200 users." : "Ramp completed. Sealing confirmed evidence.", "success");
   }
 
   async function runRamp(target: string): Promise<StageResult> {
@@ -337,23 +362,21 @@ export default function Home() {
       if (!data) return;
       const event = JSON.parse(data) as SpecialistEvent;
       if (event.type === "stage_failed") throw new Error(event.detail);
-      if (event.type === "stage_started") {
-        setProgress((current) => ({ ...current, [target]: 3 }));
-        addTrace(target, event.activity);
-      } else if (event.type === "evidence_selected") {
-        setCoverage((current) => ({ ...current, [target]: { commitSha: event.commit_sha, selected: event.selected_file_count, manifest: event.repository_path_count, complete: event.source_content_complete } }));
-        setProgress((current) => ({ ...current, [target]: 12 }));
-        addTrace(target, "Pinned " + event.commit_sha.slice(0, 8) + "; selected " + event.selected_file_count + "/" + event.repository_path_count + " source paths.");
-      } else if (event.type === "file_queued") {
-        setQueuedFiles((current) => {
-          const files = current[target] || [];
-          return files.includes(event.file_path) ? current : { ...current, [target]: files.concat(event.file_path) };
-        });
-        setProgress((current) => ({ ...current, [target]: Math.round(12 + event.index / Math.max(event.total, 1) * 70) }));
-        addTrace(target, event.activity + ": " + event.file_path);
-      } else if (event.type === "analysis_started") {
-        setProgress((current) => ({ ...current, [target]: 88 }));
-        addTrace(target, event.activity);
+      if (event.type === "phase_started" || event.type === "phase_completed") {
+        setSpecialistPhases((current) => ({
+          ...current,
+          [target]: { ...(current[target] || {}), [event.phase]: { status: event.type === "phase_started" ? "running" : "completed", activity: event.activity } },
+        }));
+        const progressByPhase: Record<SpecialistPhaseName, number> = event.type === "phase_started"
+          ? { repository_fetch: 4, specialist_analysis: 34, evidence_validation: 72 }
+          : { repository_fetch: 24, specialist_analysis: 66, evidence_validation: 94 };
+        setProgress((current) => ({ ...current, [target]: progressByPhase[event.phase] }));
+        if (event.phase === "repository_fetch" && event.type === "phase_completed" && event.commit_sha && event.selected_file_count !== undefined && event.repository_path_count !== undefined && event.source_content_complete !== undefined) {
+          setCoverage((current) => ({ ...current, [target]: { commitSha: event.commit_sha!, selected: event.selected_file_count!, manifest: event.repository_path_count!, complete: event.source_content_complete! } }));
+          addTrace(target, "Pinned " + event.commit_sha.slice(0, 8) + "; selected " + event.selected_file_count + "/" + event.repository_path_count + " source paths.", "success");
+        } else {
+          addTrace(target, (event.type === "phase_started" ? "Started: " : "Completed: ") + event.activity, event.type === "phase_completed" ? "success" : "info");
+        }
       } else if (event.type === "report_ready") {
         result = event.result;
         setProgress((current) => ({ ...current, [target]: 100 }));
@@ -406,8 +429,8 @@ export default function Home() {
       activeRampLaneRef.current = null;
       setBreakingPoint(null);
     } else {
-      setQueuedFiles((current) => ({ ...current, [stage]: [] }));
       setCoverage((current) => ({ ...current, [stage]: undefined }));
+      setSpecialistPhases((current) => ({ ...current, [stage]: {} }));
     }
     let sandbox: VercelSandbox | null = null;
     try {
@@ -461,10 +484,35 @@ export default function Home() {
     }
   }
 
+  async function createSourceFix(findingIndex: number, fixType: AutoFixType) {
+    if (!activeResult || !stage || busy) return;
+    const key = stage + ":" + findingIndex;
+    if (!sourceFixApproval[key]) return;
+    setOperation("creating_pr");
+    setError("");
+    try {
+      const result = await post<{ url: string }>("/audit-stages/source-fix-pull-request", {
+        repository_url: repository.trim(),
+        app_url: appUrl.trim(),
+        audit_id: activeResult.audit_id,
+        audit_pin: activeResult.audit_pin,
+        report: activeResult.report,
+        finding_index: findingIndex,
+        fix_type: fixType,
+        source_change_approved: true,
+      });
+      setSourceFixUrls((current) => ({ ...current, [key]: result.url }));
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Source-fix pull request creation failed.");
+    } finally {
+      setOperation("idle");
+    }
+  }
+
   async function fetchDownload(target: Stage, result: StageResult) {
     const path = target === "legal" ? "/audit-stages/legal/pdf" : "/audit-stages/" + target + "/pdf";
-    const body = target === "legal" ? { report: result.report, jurisdictions } : { report: result.report };
-    const filenames: Record<Stage, string> = { performance: "scavibe-performance-audit.pdf", security: "scavibe-security-audit.pdf", legal: "scavibe-legal-audit-and-drafts.pdf" };
+    const body = { report: result.report };
+    const filenames: Record<Stage, string> = { performance: "scavibe-performance-audit.pdf", security: "scavibe-security-audit.pdf", legal: "scavibe-data-handling-and-consent-audit.pdf" };
     const response = await fetch(apiUrl(path), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (!response.ok) {
       const payload = await response.json().catch(() => ({}));
@@ -503,7 +551,6 @@ export default function Home() {
           performance: performance.report,
           security: security.report,
           legal: legal.report,
-          jurisdictions,
         }),
       });
       if (!response.ok) {
@@ -523,9 +570,9 @@ export default function Home() {
     if (!legal || busy) return;
     setOperation("exporting");
     try {
-      const response = await fetch(apiUrl("/audit-stages/legal-artifacts"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ report: legal.report, jurisdictions }) });
+      const response = await fetch(apiUrl("/audit-stages/consent-example"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ report: legal.report }) });
       if (!response.ok) throw new Error("Consent component download failed with HTTP " + response.status);
-      triggerDownload(await response.blob(), "scavibe-consent-component.zip");
+      triggerDownload(await response.blob(), "scavibe-consent-checkbox-example.zip");
     } catch (downloadError) {
       setError(downloadError instanceof Error ? downloadError.message : "Consent component download failed.");
     } finally {
@@ -545,7 +592,7 @@ export default function Home() {
         <div className="launch-copy">
           <span className="eyebrow">Pre-release control room</span>
           <h1>Watch your release meet reality before your users do.</h1>
-          <p>Pin a public Git commit, run a real bounded sandbox ramp, inspect evidence through security and legal stages, then download the exact reports.</p>
+          <p>Pin a public Git commit, run a real bounded sandbox ramp, inspect evidence through security and data-handling and consent stages, then download the exact reports.</p>
           <div className="launch-proof"><span><Icon name="lock" /> Sandbox traffic only</span><span><Icon name="file" /> Exact evidence</span><span><Icon name="chart" /> Measured results</span></div>
         </div>
         <form className="intake-card" onSubmit={begin}>
@@ -581,55 +628,58 @@ export default function Home() {
       </aside>
       <section className="stage-content">
         <header className="stage-heading">
-          <div><span className="eyebrow">{activeMeta?.no} / {activeMeta?.label}</span><h1>{stage === "performance" ? "Find the load level where it changes." : stage === "security" ? "Trace the evidence an attacker would exploit." : "Map the data promises your product must keep."}</h1></div>
+          <div><span className="eyebrow">{activeMeta?.no} / {activeMeta?.label}</span><h1>{stage === "performance" ? "Find the load level where it changes." : stage === "security" ? "Trace the evidence an attacker would exploit." : "Map the data handling and consent paths your product must keep."}</h1></div>
           <div className="session-chip"><span>{activeResult ? "commit " + activeResult.repository.commit_sha.slice(0, 8) : coverage[stage] ? "commit " + coverage[stage]?.commitSha.slice(0, 8) : "Commit pending"}</span><small>{operation === "auditing" ? "live audit" : activeResult ? "report ready" : "not started"}</small></div>
         </header>
         <div className="stage-grid">
           <section className="visual-card">
-            <div className="visual-top"><span><Icon name={activeMeta?.icon || "bolt"} /> {stage === "performance" ? "Live sandbox ramp" : stage === "security" ? "OWASP evidence trace" : "Data-use review trace"}</span><b>{operation === "auditing" ? "LIVE" : activeResult ? "SEALED" : "READY"}</b></div>
-            <StageVisual stage={stage} progress={progress[stage]} lanes={lanes} assessment={breakingPoint || activeResult?.report.ramp_assessment || null} auditing={operation === "auditing"} />
+            <div className="visual-top"><span><Icon name={activeMeta?.icon || "bolt"} /> {stage === "performance" ? "Live sandbox ramp" : stage === "security" ? "OWASP evidence trace" : "Data-handling and consent trace"}</span><b>{operation === "auditing" ? "LIVE" : activeResult ? "SEALED" : "READY"}</b></div>
+            <StageVisual stage={stage} progress={progress[stage]} lanes={lanes} assessment={breakingPoint || activeResult?.report.ramp_assessment || null} phases={stage === "performance" ? undefined : specialistPhases[stage]} auditing={operation === "auditing"} />
             <div className="control-board">
               {stage === "performance" ? <><div className="fixed-spec"><span>Fixed exploratory schedule</span><b>10 → 200 users</b><small>9 × 12-second steps · 60-second confirmation · GET / only</small></div><div className="fixed-spec"><span>Finding admission gate</span><b>100 users · 60s · 20 samples</b><small>Lower-load results remain recorded but cannot create a performance finding.</small></div>{sandboxStatus ? <p className="sandbox-status"><Icon name="lock" /> {sandboxStatus}</p> : null}</> : null}
               {stage === "security" ? <p className="stage-explainer">The specialist follows OWASP-oriented checks over the pinned source evidence. Every filed finding requires exact source evidence.</p> : null}
-              {stage === "legal" ? <><p className="stage-explainer">The legal stage maps observed data-handling signals and prepares working drafts. It does not certify compliance or replace legal counsel.</p><div className="jurisdiction-row">{["KE", "EU", "US-CA"].map((item) => <button key={item} type="button" className={jurisdictions.includes(item) ? "selected" : ""} onClick={() => toggleJurisdiction(item)}>{jurisdictions.includes(item) ? <Icon name="check" /> : null}{item}</button>)}</div></> : null}
+              {stage === "legal" ? <><p className="stage-explainer">The data-handling and consent audit maps observed product signals to specific recommendations. It does not certify compliance or replace legal counsel.</p><div className="jurisdiction-row">{["KE", "EU", "US-CA"].map((item) => <button key={item} type="button" className={jurisdictions.includes(item) ? "selected" : ""} onClick={() => toggleJurisdiction(item)}>{jurisdictions.includes(item) ? <Icon name="check" /> : null}{item}</button>)}</div></> : null}
             </div>
-            <button className="primary full run-button" disabled={!canRun} onClick={() => void runStage()}>{operation === "auditing" ? "Processing verified evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized load ramp" : "Start " + stage + " review"} {operation === "auditing" ? <Icon name="terminal" /> : activeResult ? <Icon name="refresh" /> : <Icon name="arrow" />}</button>
+            <button className="primary full run-button" disabled={!canRun} onClick={() => void runStage()}>{operation === "auditing" ? "Processing verified evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized load ramp" : stage === "legal" ? "Start data-handling and consent audit" : "Start security review"} {operation === "auditing" ? <Icon name="terminal" /> : activeResult ? <Icon name="refresh" /> : <Icon name="arrow" />}</button>
             {error ? <p className="form-error panel-error">{error}</p> : null}
           </section>
-          <Terminal stage={stage} trace={trace} coverage={coverage[stage]} files={queuedFiles[stage] || []} progress={progress[stage]} auditing={operation === "auditing"} />
+          <Terminal stage={stage} trace={trace} coverage={coverage[stage]} progress={progress[stage]} auditing={operation === "auditing"} />
         </div>
-        {activeResult ? <ReportPanel result={activeResult} /> : null}
-        {activeResult || coverage[stage] ? <EvidencePanel result={activeResult} coverage={coverage[stage]} files={queuedFiles[stage] || []} /> : null}
-        {activeResult ? <section className="action-card"><div><span className="eyebrow">Controlled next actions</span><h2>{stage === "legal" ? "Keep the report and legal drafts together." : "Turn the measured result into a reviewable artifact."}</h2><p>PDF exports preserve exact evidence, precomputed scores, limitations, timestamp, and pinned commit. The artifact PR adds reports and drafts only; it does not silently edit application code.</p></div><div className="action-buttons"><button className="secondary" disabled={busy} onClick={() => void downloadPdf(stage)}><Icon name="download" /> Download {stage} PDF</button>{stage === "legal" ? <button className="secondary" disabled={busy} onClick={() => void downloadConsent()}><Icon name="file" /> Consent component (.zip)</button> : null}<label className="checkline approval"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing audit artifacts, not unreviewed source-code edits.</span></label><button className="secondary" disabled={!prApproved || busy} onClick={() => void createArtifactPr()}><Icon name="branch" /> Create artifact PR</button>{prUrl ? <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft PR <Icon name="arrow" /></a> : null}{stage !== "legal" ? <button className="primary" disabled={busy} onClick={() => setStage(stage === "performance" ? "security" : "legal")}>Continue to {stage === "performance" ? "cybersecurity" : "legal"} <Icon name="arrow" /></button> : null}</div></section> : null}
+        {activeResult ? <ReportPanel result={activeResult} busy={busy} approvals={sourceFixApproval} urls={sourceFixUrls} onApprovalChange={(key, approved) => setSourceFixApproval((current) => ({ ...current, [key]: approved }))} onCreateSourceFix={(findingIndex, fixType) => void createSourceFix(findingIndex, fixType)} /> : null}
+        {activeResult || coverage[stage] ? <EvidencePanel result={activeResult} coverage={coverage[stage]} /> : null}
+        {activeResult ? <section className="action-card"><div><span className="eyebrow">Controlled next actions</span><h2>{stage === "legal" ? "Keep the data-handling and consent audit together." : "Turn the measured result into a reviewable artifact."}</h2><p>PDF exports preserve exact evidence, precomputed scores, limitations, timestamp, and pinned commit. The artifact PR adds the audit report and consent example only; it does not silently edit application code.</p></div><div className="action-buttons"><button className="secondary" disabled={busy} onClick={() => void downloadPdf(stage)}><Icon name="download" /> Download {stage === "legal" ? "data-handling" : stage} PDF</button>{stage === "legal" ? <button className="secondary" disabled={busy} onClick={() => void downloadConsent()}><Icon name="file" /> Consent checkbox example (.zip)</button> : null}<label className="checkline approval"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing audit artifacts, not unreviewed source-code edits.</span></label><button className="secondary" disabled={!prApproved || busy} onClick={() => void createArtifactPr()}><Icon name="branch" /> Create artifact PR</button>{prUrl ? <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft PR <Icon name="arrow" /></a> : null}{stage !== "legal" ? <button className="primary" disabled={busy} onClick={() => setStage(stage === "performance" ? "security" : "legal")}>Continue to {stage === "performance" ? "cybersecurity" : "data handling and consent"} <Icon name="arrow" /></button> : null}</div></section> : null}
         {allComplete ? <FinalAnalytics results={results as Record<Stage, StageResult>} total={totalFindings} busy={busy} onDownload={() => void downloadAll()} /> : null}
       </section>
     </div>
   </main>;
 }
 
-function StageVisual({ stage, progress, lanes, assessment, auditing }: { stage: Stage; progress: number | null; lanes: Record<string, RampLane>; assessment: RampAssessment | null; auditing: boolean }) {
+function StageVisual({ stage, progress, lanes, assessment, phases, auditing }: { stage: Stage; progress: number | null; lanes: Record<string, RampLane>; assessment: RampAssessment | null; phases?: Partial<Record<SpecialistPhaseName, SpecialistPhaseState>>; auditing: boolean }) {
   const label = progress === null ? "Waiting for a server event" : progress + "% event-derived progress";
   if (stage === "performance") return <div className="stage-visual performance-visual"><div className="visual-progress"><span>{label}</span><b>{progress === null ? "—" : progress + "%"}</b></div><div className="ramp-grid">{schedule.map((users, index) => { const confirmation = lanes["confirmation:" + index]; const exploratory = lanes["exploratory:" + index]; const lane = confirmation || exploratory; const phase = confirmation ? "confirmed" : lane?.status === "running" ? "exploring" : lane?.status === "completed" ? "explored" : "queued"; return <article key={users} className={["ramp-lane", lane?.status || "waiting", lane?.breached ? "breached" : ""].join(" ")}><div><span>{String(index + 1).padStart(2, "0")}</span><b>{users}</b></div><i /><small>{phase}</small><em>{lane?.samples ? lane.samples + " samples" : "—"}</em></article>; })}</div><div className="visual-foot"><span>{assessment?.breaking_point_concurrent_users ? "First breach: " + assessment.breaking_point_concurrent_users + " users" : "No breaking point recorded yet."}</span><span>{assessment?.metric ? assessment.metric + " " + assessment.observed_value + " / " + assessment.threshold : "p95 > 500ms or errors > 1.0%"}</span></div></div>;
-  return <div className={["stage-visual", "specialist-visual", stage === "security" ? "security-visual" : "legal-visual"].join(" ")}><div className="visual-progress"><span>{label}</span><b>{progress === null ? "—" : progress + "%"}</b></div><div className={["scanner-core", auditing ? "active" : ""].join(" ")}><i /><i /><i /><i /></div><div className="evidence-cards"><article><Icon name={stage === "security" ? "shield" : "file"} /><span>{stage === "security" ? "Authentication" : "Data inventory"}</span><i /></article><article><Icon name={stage === "security" ? "terminal" : "scale"} /><span>{stage === "security" ? "Input handling" : "Policy coverage"}</span><i /></article><article><Icon name="check" /><span>{stage === "security" ? "OWASP verdict" : "Draft verdict"}</span><i /></article></div><p>{auditing ? "Streaming factual evidence-selection milestones." : "The visual activates only from server-delivered milestones."}</p></div>;
+  const phaseLabels: Record<SpecialistPhaseName, string> = { repository_fetch: "Repository evidence", specialist_analysis: "Specialist analysis", evidence_validation: "Evidence validation" };
+  const phaseIcons: Record<SpecialistPhaseName, IconName> = { repository_fetch: "file", specialist_analysis: stage === "security" ? "shield" : "scale", evidence_validation: "check" };
+  const orderedPhases: SpecialistPhaseName[] = ["repository_fetch", "specialist_analysis", "evidence_validation"];
+  return <div className={["stage-visual", "specialist-visual", stage === "security" ? "security-visual" : "legal-visual"].join(" ")}><div className="visual-progress"><span>{label}</span><b>{progress === null ? "—" : progress + "%"}</b></div><div className={["scanner-core", auditing ? "active" : ""].join(" ")}><i /><i /><i /><i /></div><div className="phase-cards">{orderedPhases.map((phase) => { const current = phases?.[phase]; return <article key={phase} className={current?.status || "waiting"}><Icon name={phaseIcons[phase]} /><span>{phaseLabels[phase]}</span><small>{current?.status || "waiting"}</small><i /></article>; })}</div><p>{auditing ? "Animation state follows the live server phase." : "This visual activates only from server-delivered phase transitions."}</p></div>;
 }
 
-function Terminal({ stage, trace, coverage, files, progress, auditing }: { stage: Stage; trace: Trace[]; coverage?: Coverage; files: string[]; progress: number | null; auditing: boolean }) {
+function Terminal({ stage, trace, coverage, progress, auditing }: { stage: Stage; trace: Trace[]; coverage?: Coverage; progress: number | null; auditing: boolean }) {
   const lines = trace.filter((item) => item.stage === stage).slice(-14);
-  return <section className="console-card" aria-live="polite" aria-busy={auditing}><header><span><i /> Evidence terminal</span><b>{auditing ? "STREAM OPEN" : progress === 100 ? "REPORT SEALED" : "IDLE"}</b></header><p className="console-command">$ scavibe audit --stage {stage} --evidence-only</p><div className="console-lines">{lines.length === 0 ? <p className="console-empty">No server event received yet. Start the stage to stream verified work.</p> : lines.map((line) => <p key={line.id} className={"trace-" + line.kind}><time>{line.at}</time><i>{line.kind === "error" || line.kind === "warn" ? "!" : line.kind === "success" ? "✓" : "›"}</i><span>{line.text}</span></p>)}</div>{coverage ? <div className="coverage-readout"><span>Evidence coverage</span><b>{coverage.selected} selected / {coverage.manifest} manifest paths</b><small>{coverage.complete ? "Every supported text file was supplied." : "Source selection is capped; repository-wide absence claims are blocked."}</small></div> : null}{files.length > 0 ? <div className="console-file"><span>Latest source input</span><code>{files[files.length - 1]}</code></div> : null}</section>;
+  return <section className="console-card" aria-live="polite" aria-busy={auditing}><header><span><i /> Evidence terminal</span><b>{auditing ? "STREAM OPEN" : progress === 100 ? "REPORT SEALED" : "IDLE"}</b></header><p className="console-command">$ scavibe audit --stage {stage} --evidence-only</p><div className="console-lines">{lines.length === 0 ? <p className="console-empty">No server event received yet. Start the stage to stream verified work.</p> : lines.map((line) => <p key={line.id} className={"trace-" + line.kind}><time>{line.at}</time><i>{line.kind === "error" || line.kind === "warn" ? "!" : line.kind === "success" ? "✓" : "›"}</i><span>{line.text}</span></p>)}</div>{coverage ? <div className="coverage-readout"><span>Evidence coverage</span><b>{coverage.selected} selected / {coverage.manifest} manifest paths</b><small>{coverage.complete ? "Every supported text file was supplied." : "Source selection is capped; repository-wide absence claims are blocked."}</small></div> : null}</section>;
 }
 
-function ReportPanel({ result }: { result: StageResult }) {
+function ReportPanel({ result, busy, approvals, urls, onApprovalChange, onCreateSourceFix }: { result: StageResult; busy: boolean; approvals: Record<string, boolean>; urls: Record<string, string>; onApprovalChange: (key: string, approved: boolean) => void; onCreateSourceFix: (findingIndex: number, fixType: AutoFixType) => void }) {
   const report = result.report;
   const measurement = result.measurement;
   const assessment = report.ramp_assessment;
-  return <section className="report-panel"><header><div><span className="eyebrow">Verified report</span><h2>{report.stage} verdict</h2></div><b>{report.findings.length} finding{report.findings.length === 1 ? "" : "s"}</b></header>{measurement ? <div className="metric-grid"><div><span>Confirmed load</span><b>{measurement.concurrent_users}</b><small>users</small></div><div><span>P95 latency</span><b>{measurement.p95_latency_ms === null ? "N/A" : measurement.p95_latency_ms}</b><small>{measurement.p95_latency_ms === null ? "0 successes" : "ms"}</small></div><div><span>Error rate</span><b>{measurement.error_rate_percent}</b><small>%</small></div></div> : null}{assessment ? <p className="breakpoint-readout">{assessment.breaking_point_concurrent_users === null ? "Ramp result: no breaking point identified from 10 to 200 users." : "Ramp result: first exploratory breach at " + assessment.breaking_point_concurrent_users + " users via " + assessment.metric + "=" + assessment.observed_value + " (threshold " + assessment.threshold + ")."}</p> : null}<p className="report-summary">{report.summary}</p><div className="finding-list">{report.findings.length === 0 ? <p className="no-findings"><Icon name="check" /> No evidence-backed findings were filed.</p> : report.findings.map((finding) => <article className={["finding", finding.severity].join(" ")} key={finding.title}><div><span>{finding.severity}</span><b>{finding.risk_score}/100 · {finding.confidence_score}% confidence</b></div><h3>{finding.title}</h3><p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p><details><summary>Exact evidence</summary><ul>{finding.evidence.map((item, index) => <li key={item.kind + index}>{item.kind === "source" ? item.file_path + " lines " + item.start_line + "-" + item.end_line + ": " + item.quote : item.kind === "runtime" ? item.measurement_id + " " + item.endpoint + ": " + item.metric + "=" + item.observed_value + ", threshold=" + item.threshold : "Manifest path: " + item.file_path}</li>)}</ul></details></article>)}</div><details className="limitations"><summary>Limitations ({report.limitations.length})</summary><ul>{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></section>;
+  return <section className="report-panel"><header><div><span className="eyebrow">Verified report</span><h2>{report.stage === "legal" ? "data-handling and consent verdict" : report.stage + " verdict"}</h2></div><b>{report.findings.length} finding{report.findings.length === 1 ? "" : "s"}</b></header>{measurement ? <div className="metric-grid"><div><span>Confirmed load</span><b>{measurement.concurrent_users}</b><small>users</small></div><div><span>P95 latency</span><b>{measurement.p95_latency_ms === null ? "N/A" : measurement.p95_latency_ms}</b><small>{measurement.p95_latency_ms === null ? "0 successes" : "ms"}</small></div><div><span>Error rate</span><b>{measurement.error_rate_percent}</b><small>%</small></div></div> : null}{assessment ? <p className="breakpoint-readout">{assessment.breaking_point_concurrent_users === null ? "Confirmed ramp result: no breaking point identified from 10 to 200 users." : "Confirmed ramp result: " + assessment.metric + "=" + assessment.observed_value + " at " + assessment.breaking_point_concurrent_users + " users (threshold " + assessment.threshold + ")."}</p> : null}<p className="report-summary">{report.summary}</p><div className="finding-list">{report.findings.length === 0 ? <p className="no-findings"><Icon name="check" /> No evidence-backed findings were filed.</p> : report.findings.map((finding, findingIndex) => { const offer = autoFixOffer(report.stage, finding); const key = report.stage + ":" + findingIndex; return <article className={["finding", finding.severity].join(" ")} key={finding.title}><div><span>{finding.severity}</span><b>{finding.risk_score}/100 · {finding.confidence_score}% confidence</b></div><h3>{finding.title}</h3><p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p><details><summary>Exact evidence</summary><ul>{finding.evidence.map((item, index) => <li key={item.kind + index}>{item.kind === "source" ? item.file_path + " lines " + item.start_line + "-" + item.end_line + ": " + item.quote : item.kind === "runtime" ? item.measurement_id + " " + item.endpoint + ": " + item.metric + "=" + item.observed_value + ", threshold=" + item.threshold : "Manifest path: " + item.file_path}</li>)}</ul></details>{offer ? <div className="source-fix"><b>Bounded source change</b><p>{offer.fixType === "rate_limit_middleware" ? "Creates a FastAPI middleware at 60 requests per 60 seconds per IP, a conservative starting point to review." : "Creates one React/Next checkbox component and integrates it into the cited form."}</p><label className="checkline"><input type="checkbox" checked={Boolean(approvals[key])} onChange={(event) => onApprovalChange(key, event.target.checked)} /><span>This will generate real source code and open a pull request containing an actual code change to your repository. Review the diff carefully before merging — I am not responsible for reviewing this code for you.</span></label><button className="secondary" disabled={busy || !approvals[key]} onClick={() => onCreateSourceFix(findingIndex, offer.fixType)}><Icon name="branch" /> {offer.label}</button>{urls[key] ? <a className="pr-link" href={urls[key]} target="_blank" rel="noreferrer">Open source-fix PR <Icon name="arrow" /></a> : null}</div> : null}</article>; })}</div><details className="limitations"><summary>Limitations ({report.limitations.length})</summary><ul>{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></section>;
 }
 
-function EvidencePanel({ result, coverage, files }: { result?: StageResult; coverage?: Coverage; files: string[] }) {
-  const paths = result ? result.repository.selected_files : files;
+function EvidencePanel({ result, coverage }: { result?: StageResult; coverage?: Coverage }) {
+  const paths = result?.repository.selected_files || [];
   const complete = result ? result.repository.source_content_complete : coverage?.complete;
-  const count = paths.length;
-  return <section className="evidence-panel"><div><span className="eyebrow">Evidence scope</span><h2>Files actually supplied to this stage</h2><p>{complete ? "All supported text source files were supplied as evidence." : "This audit shows selected evidence. A capped source selection does not become a repository-wide absence claim."}</p></div><b>{count} source files</b><div className="file-strip">{paths.map((path) => <code key={path}>{path}</code>)}</div></section>;
+  const count = result ? paths.length : coverage?.selected || 0;
+  return <section className="evidence-panel"><div><span className="eyebrow">Evidence scope</span><h2>Files actually supplied to this stage</h2><p>{complete ? "All supported text source files were supplied as evidence." : "This audit shows selected evidence. A capped source selection does not become a repository-wide absence claim."}</p></div><b>{count} source files</b>{result ? <div className="file-strip">{paths.map((path) => <code key={path}>{path}</code>)}</div> : <p className="evidence-pending">The live stream reports the verified count only. Exact paths appear after the sealed report is returned.</p>}</section>;
 }
 
 function FinalAnalytics({ results, total, busy, onDownload }: { results: Record<Stage, StageResult>; total: number; busy: boolean; onDownload: () => void }) {
@@ -637,5 +687,5 @@ function FinalAnalytics({ results, total, busy, onDownload }: { results: Record<
   const serious = findings.filter((item) => item.severity === "high" || item.severity === "critical").length;
   const sourceCount = Object.values(results).reduce((sum, result) => sum + result.repository.selected_files.length, 0);
   const breakpoint = results.performance.report.ramp_assessment?.breaking_point_concurrent_users;
-  return <section className="final-analytics"><div className="final-copy"><span className="eyebrow">All stages complete</span><h2>One commit. Three evidence-backed views.</h2><p>The dashboard aggregates returned reports only. It does not recompute score or severity in the browser.</p></div><div className="analytics-grid"><article><span>Total findings</span><b>{total}</b><small>across all stages</small></article><article><span>High / critical</span><b>{serious}</b><small>precomputed severity</small></article><article><span>Evidence files</span><b>{sourceCount}</b><small>selected source inputs</small></article><article><span>Load ramp</span><b>{breakpoint || "none"}</b><small>{breakpoint ? "first exploratory breach users" : "no exploratory break 10–200"}</small></article></div><div className="final-actions"><span>Commit {results.performance.repository.commit_sha.slice(0, 12)} · Downloaded PDFs retain their audit timestamp and exact evidence.</span><button className="primary" disabled={busy} onClick={onDownload}><Icon name="download" /> Download all 3 PDFs</button></div></section>;
+  return <section className="final-analytics"><div className="final-copy"><span className="eyebrow">All stages complete</span><h2>One commit. Three evidence-backed views.</h2><p>The dashboard aggregates returned reports only. It does not recompute score or severity in the browser.</p></div><div className="analytics-grid"><article><span>Total findings</span><b>{total}</b><small>across all stages</small></article><article><span>High / critical</span><b>{serious}</b><small>precomputed severity</small></article><article><span>Evidence files</span><b>{sourceCount}</b><small>selected source inputs</small></article><article><span>Load ramp</span><b>{breakpoint || "none"}</b><small>{breakpoint ? "confirmed breaking point users" : "no confirmed break 10–200"}</small></article></div><div className="final-actions"><span>Commit {results.performance.repository.commit_sha.slice(0, 12)} · Downloaded PDFs retain their audit timestamp and exact evidence.</span><button className="primary" disabled={busy} onClick={onDownload}><Icon name="download" /> Download all 3 PDFs</button></div></section>;
 }

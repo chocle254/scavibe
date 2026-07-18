@@ -9,7 +9,7 @@ import os
 import hmac
 import asyncio
 import json
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from datetime import datetime, timezone
 from io import BytesIO
 from uuid import uuid4
@@ -18,7 +18,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 import httpx
 
 from scavibe.agents import AgentProtocolError, AuditOrchestrator, NvidiaNimGateway, NvidiaNimSettings, SpecialistAgent
@@ -53,6 +53,7 @@ from scavibe.repository import (
     suggest_sandboxes,
 )
 from scavibe.reporting import report_markdown
+from scavibe.fix_plans import AutoFixPlanError, FixType, build_auto_fix_plan
 from scavibe.scoring import confidence_score, risk_score, severity_for
 from scavibe.agents.thresholds import (
     PERFORMANCE_ERROR_RATE_THRESHOLD_PERCENT,
@@ -155,9 +156,8 @@ class StageAuditResponse(BaseModel):
     sandbox_teardown: str | None = None
 
 
-class LegalArtifactRequest(BaseModel):
+class ConsentExampleRequest(BaseModel):
     report: AgentReport
-    jurisdictions: list[str]
 
 
 class StagePdfRequest(BaseModel):
@@ -170,7 +170,6 @@ class AuditPdfArchiveRequest(BaseModel):
     performance: AgentReport
     security: AgentReport
     legal: AgentReport
-    jurisdictions: list[str]
 
 
 class RampReportRequest(BaseModel):
@@ -187,6 +186,17 @@ class PullRequestRequest(BaseModel):
 class PullRequestResponse(BaseModel):
     url: HttpUrl
     branch: str
+
+
+class SourceFixPullRequestRequest(BaseModel):
+    repository_url: HttpUrl
+    app_url: HttpUrl
+    audit_id: str
+    audit_pin: str
+    report: AgentReport
+    finding_index: int = Field(ge=0)
+    fix_type: FixType
+    source_change_approved: bool = False
 
 
 class SandboxSuggestionResponse(BaseModel):
@@ -626,10 +636,10 @@ def _performance_report(
     )
 
 
-async def _specialist_report(stage: Stage, context: AuditContext) -> AgentReport:
+async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
     try:
         settings = NvidiaNimSettings.from_environment()
-        report = await SpecialistAgent(stage, NvidiaNimGateway(settings)).analyze(context)
+        report = await SpecialistAgent(stage, NvidiaNimGateway(settings)).analyze(context, on_phase=on_phase)
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except AgentProtocolError as error:
@@ -646,13 +656,14 @@ def _sse_data(event: dict) -> str:
 
 
 def _specialist_stage_stream(stage: Stage, request: StageAuditRequest) -> StreamingResponse:
-    """Stream only factual evidence-selection and report milestones for one specialist stage."""
+    """Stream only the real repository, analysis, and evidence-validation phases."""
     async def event_stream():
         yield _sse_data(
             {
-                "type": "stage_started",
+                "type": "phase_started",
                 "stage": stage.value,
-                "activity": "pinning immutable repository commit",
+                "phase": "repository_fetch",
+                "activity": "fetching and pinning immutable repository evidence",
             }
         )
         try:
@@ -662,39 +673,48 @@ def _specialist_stage_stream(stage: Stage, request: StageAuditRequest) -> Stream
             return
         yield _sse_data(
             {
-                "type": "evidence_selected",
+                "type": "phase_completed",
                 "stage": stage.value,
+                "phase": "repository_fetch",
+                "activity": "immutable repository evidence is pinned",
                 "commit_sha": snapshot.context.commit_sha,
                 "selected_file_count": len(snapshot.selected_paths),
                 "repository_path_count": len(snapshot.context.repository_paths),
                 "source_content_complete": snapshot.source_content_complete,
             }
         )
-        activity = "OWASP evidence input queued" if stage == Stage.SECURITY else "data-handling evidence input queued"
-        selected_total = len(snapshot.selected_paths)
-        for index, path in enumerate(snapshot.selected_paths, start=1):
-            yield _sse_data(
-                {
-                    "type": "file_queued",
-                    "stage": stage.value,
-                    "file_path": path,
-                    "index": index,
-                    "total": selected_total,
-                    "activity": activity,
-                }
-            )
-        yield _sse_data(
-            {
-                "type": "analysis_started",
-                "stage": stage.value,
-                "activity": "validating evidence-backed specialist findings",
-            }
-        )
+
+        phase_events: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def on_phase(event_type: str, phase: str) -> None:
+            activity = {
+                "specialist_analysis": "analyzing the pinned specialist evidence input",
+                "evidence_validation": "validating exact evidence and deterministic scoring",
+            }[phase]
+            await phase_events.put({"type": event_type, "stage": stage.value, "phase": phase, "activity": activity})
+
+        task = asyncio.create_task(_specialist_report(stage, snapshot.context, on_phase=on_phase))
         try:
-            report = await _specialist_report(stage, snapshot.context)
+            while not task.done() or not phase_events.empty():
+                if not phase_events.empty():
+                    yield _sse_data(phase_events.get_nowait())
+                    continue
+                phase_waiter = asyncio.create_task(phase_events.get())
+                completed, _ = await asyncio.wait({task, phase_waiter}, return_when=asyncio.FIRST_COMPLETED)
+                if phase_waiter in completed:
+                    yield _sse_data(phase_waiter.result())
+                else:
+                    phase_waiter.cancel()
+                    await asyncio.gather(phase_waiter, return_exceptions=True)
+                    await task
+            report = await task
         except HTTPException as error:
             yield _sse_data({"type": "stage_failed", "stage": stage.value, "detail": str(error.detail)})
             return
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         result = StageAuditResponse(
             stage=stage,
             audit_id=audit_id,
@@ -868,7 +888,7 @@ async def audit_security_stream(request: StageAuditRequest) -> StreamingResponse
 @app.post("/audit-stages/legal", response_model=StageAuditResponse)
 async def audit_legal(request: StageAuditRequest) -> StageAuditResponse:
     if not request.jurisdictions:
-        raise HTTPException(status_code=422, detail="legal requires at least one explicit jurisdiction code")
+        raise HTTPException(status_code=422, detail="data-handling and consent audit requires at least one explicit jurisdiction code")
     snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
     report = await _specialist_report(Stage.LEGAL, snapshot.context)
     return StageAuditResponse(stage=Stage.LEGAL, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
@@ -877,144 +897,32 @@ async def audit_legal(request: StageAuditRequest) -> StageAuditResponse:
 @app.post("/audit-stages/legal/stream")
 async def audit_legal_stream(request: StageAuditRequest) -> StreamingResponse:
     if not request.jurisdictions:
-        raise HTTPException(status_code=422, detail="legal requires at least one explicit jurisdiction code")
+        raise HTTPException(status_code=422, detail="data-handling and consent audit requires at least one explicit jurisdiction code")
     return _specialist_stage_stream(Stage.LEGAL, request)
 
 
-def _legal_artifact_files(report: AgentReport, jurisdictions: list[str]) -> dict[str, str]:
-    jurisdiction_label = ", ".join(jurisdictions) or "No jurisdiction supplied"
-    finding_rows = "\n".join(
-        f"- **{finding.severity.value.upper()}** — {finding.title}: {finding.remediation}"
-        for finding in report.findings
-    ) or "- No evidence-backed legal findings were returned. This is not a compliance determination."
+def _consent_example_files() -> dict[str, str]:
+    """Return one additive UI-pattern example, never a drafted legal document."""
     return {
-        "README.md": (
-            "# Scavibe legal review pack\n\n"
-            "This pack is an AI-generated working draft built from the supplied repository evidence and the listed jurisdictions. "
-            "It is not legal advice, it does not establish compliance, and it must be reviewed by a qualified lawyer before publication.\n\n"
-            "## Included files\n\n"
-            "- `SCAVIBE_LEGAL_REVIEW.md` — evidence-backed audit report.\n"
-            "- `DRAFT_PRIVACY_POLICY.md` — publication draft with completion fields.\n"
-            "- `DRAFT_TERMS_OF_SERVICE.md` — publication draft with completion fields.\n"
-            "- `DATA_PROCESSING_INVENTORY.md` — evidence and completion inventory.\n"
-            "- `IMPLEMENTATION_CHECKLIST.md` — product implementation tasks.\n"
-            "- `ConsentCheckbox.tsx` — styled React consent component.\n\n"
-            "## Required completion rule\n\n"
-            "Replace every `[VERIFY: ...]` field using verified product, entity, data-flow, and legal-review information. Do not publish a draft with unresolved completion fields.\n"
-        ),
-        "SCAVIBE_LEGAL_REVIEW.md": report_markdown(report),
-        "DRAFT_PRIVACY_POLICY.md": (
-            "# Draft Privacy Policy\n\n"
-            "**Status:** AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
-            f"**Jurisdictions supplied for review:** {jurisdiction_label}.\n\n"
-            "## 1. Who operates this service\n\n"
-            "[VERIFY: legal entity name, trading name, physical address, and privacy contact email.]\n\n"
-            "## 2. Scope of this notice\n\n"
-            "This notice must describe the information practices of [VERIFY: product name and domains/apps covered]. It must be published where users can access it before submitting personal information.\n\n"
-            "## 3. Information inventory\n\n"
-            "| Category | Source | Purpose | Required or optional | Evidence / owner |\n"
-            "| --- | --- | --- | --- | --- |\n"
-            "| [VERIFY: account data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n"
-            "| [VERIFY: device or usage data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n"
-            "| [VERIFY: payment/support data] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] |\n\n"
-            "## 4. How information is used\n\n"
-            "[VERIFY: list each processing purpose supported by the completed inventory. Do not describe a purpose that is not actually implemented.]\n\n"
-            "## 5. Sharing, processors, and transfers\n\n"
-            "[VERIFY: list every service provider, analytics provider, hosting provider, payment provider, and transfer destination. State the operational role and contractual status for each.]\n\n"
-            "## 6. Retention and deletion\n\n"
-            "[VERIFY: retention period or objective retention rule for every information category, deletion method, backup treatment, and account-closure process.]\n\n"
-            "## 7. Security and access controls\n\n"
-            "[VERIFY: state only implemented technical and organizational controls. Do not promise absolute security or controls that have not been verified.]\n\n"
-            "## 8. User requests and contact\n\n"
-            "[VERIFY: request channel, identity-verification process, escalation route, and response workflow for each supplied jurisdiction.]\n\n"
-            "## 9. Children and age gating\n\n"
-            "[VERIFY: applicable age rule, age-screen behavior, parental-consent flow if applicable, and deletion/escalation procedure. Do not publish a numeric age without legal review for the supplied jurisdictions.]\n\n"
-            "## 10. Changes to this notice\n\n"
-            "[VERIFY: effective-date process, material-change notice method, and archive location for prior versions.]\n"
-        ),
-        "DRAFT_TERMS_OF_SERVICE.md": (
-            "# Draft Terms of Service\n\n"
-            "**Status:** AI-generated working draft. Obtain review from a licensed attorney before publication.\n\n"
-            "## 1. Agreement and service operator\n\n"
-            "[VERIFY: product name, legal entity, contact address, effective date, and acceptance event.]\n\n"
-            "## 2. Eligibility and accounts\n\n"
-            "[VERIFY: eligibility requirements, age-screen behavior, account-registration data, credential responsibilities, and account suspension/deletion process.]\n\n"
-            "## 3. Permitted use\n\n"
-            "[VERIFY: product-specific permitted use, technical limits, and user-content rules.]\n\n"
-            "## 4. Prohibited conduct\n\n"
-            "[VERIFY: prohibited use categories that are appropriate for this product, including security abuse, impersonation, unlawful content, and interference with service operation.]\n\n"
-            "## 5. Fees, subscriptions, and refunds\n\n"
-            "[VERIFY: whether payments exist. If they do, specify pricing display, renewal, cancellation, refund, tax, and payment-processor terms.]\n\n"
-            "## 6. Intellectual property and user content\n\n"
-            "[VERIFY: ownership, permitted license, user-content license if applicable, takedown process, and third-party material rules.]\n\n"
-            "## 7. Service availability and changes\n\n"
-            "[VERIFY: maintenance, change-notice, support, and discontinuation commitments. Do not promise uptime levels that have not been adopted operationally.]\n\n"
-            "## 8. Disclaimers, liability, and dispute terms\n\n"
-            "[VERIFY WITH COUNSEL: jurisdiction-specific disclaimer, liability, indemnity, governing-law, venue, and dispute-resolution language.]\n\n"
-            "## 9. Contact\n\n"
-            "[VERIFY: legal and support contact details.]\n"
-        ),
-        "DATA_PROCESSING_INVENTORY.md": (
-            "# Data Processing Inventory\n\n"
-            f"**Supplied jurisdictions:** {jurisdiction_label}\n\n"
-            "## Evidence-backed audit outcomes\n\n"
-            f"{finding_rows}\n\n"
-            "## Completion inventory\n\n"
-            "| Data element | Collection point | Storage location | Processor | Purpose | Retention rule | Owner | Verification status |\n"
-            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
-            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n"
-            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n"
-            "| [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | [VERIFY] | Open |\n\n"
-            "## Required review questions\n\n"
-            "1. Does each collected field have an evidence-backed purpose?\n"
-            "2. Is each processor and transfer destination listed?\n"
-            "3. Does each field have a verified retention rule and owner?\n"
-            "4. Does the completed privacy notice match this inventory exactly?\n"
-        ),
-        "IMPLEMENTATION_CHECKLIST.md": (
-            "# Legal and Privacy Implementation Checklist\n\n"
-            "## Before publication\n\n"
-            "- [ ] Replace every `[VERIFY: ...]` completion field in the drafts.\n"
-            "- [ ] Confirm the policy inventory against the deployed product and every processor.\n"
-            "- [ ] Obtain qualified legal review for the supplied jurisdictions.\n"
-            "- [ ] Publish the approved Privacy Policy and Terms at stable URLs.\n"
-            "- [ ] Link both documents from signup, checkout, account, and footer surfaces that exist in the product.\n"
-            "- [ ] Store a version identifier and acceptance timestamp when terms acceptance is required.\n"
-            "- [ ] Implement age screening only after the applicable rule and flow are verified.\n"
-            "- [ ] Test request, deletion, export, and support workflows that the completed policy promises.\n\n"
-            "## Engineering evidence to retain\n\n"
-            "- [ ] Commit SHA reviewed by Scavibe.\n"
-            "- [ ] Approved policy and terms version IDs.\n"
-            "- [ ] Processor and data-flow inventory.\n"
-            "- [ ] Consent and acceptance event schema.\n"
-            "- [ ] Legal-review approval record.\n"
-        ),
         "ConsentCheckbox.tsx": (
-            "type TermsConsentProps = {\n"
-            "  privacyPolicyUrl: string;\n"
-            "  termsUrl: string;\n"
-            "  onAcceptanceChange?: (accepted: boolean) => void;\n"
+            "type ConsentCheckboxProps = {\n"
+            "  onConsentChange?: (accepted: boolean) => void;\n"
             "};\n\n"
-            "export function TermsConsent({ privacyPolicyUrl, termsUrl, onAcceptanceChange }: TermsConsentProps) {\n"
+            "export function ConsentCheckbox({ onConsentChange }: ConsentCheckboxProps) {\n"
             "  return (\n"
             "    <label style={{ display: 'flex', gap: 8, alignItems: 'flex-start', fontSize: 14, lineHeight: 1.5 }}>\n"
             "      <input\n"
             "        type=\"checkbox\"\n"
-            "        name=\"termsAccepted\"\n"
+            "        name=\"dataConsent\"\n"
             "        required\n"
-            "        onChange={(event) => onAcceptanceChange?.(event.target.checked)}\n"
+            "        onChange={(event) => onConsentChange?.(event.target.checked)}\n"
             "      />\n"
-            "      <span>\n"
-            "        I confirm that I meet the applicable eligibility requirements and have read the{' '}\n"
-            "        <a href={termsUrl} target=\"_blank\" rel=\"noreferrer\">Terms of Service</a>{' '}and{' '}\n"
-            "        <a href={privacyPolicyUrl} target=\"_blank\" rel=\"noreferrer\">Privacy Policy</a>.\n"
-            "      </span>\n"
+            "      <span>I confirm that I meet the eligibility requirements and consent to the data handling described to me.</span>\n"
             "    </label>\n"
             "  );\n"
             "}\n"
-        ),
+        )
     }
-
 
 def _pdf_response(pdf: bytes, filename: str) -> StreamingResponse:
     document = BytesIO(pdf)
@@ -1026,15 +934,16 @@ def _pdf_response(pdf: bytes, filename: str) -> StreamingResponse:
     )
 
 
-def _stage_pdf_bytes(report: AgentReport, *, legal_drafts: tuple[str, str] | None = None) -> bytes:
+def _stage_pdf_bytes(report: AgentReport) -> bytes:
     try:
-        from scavibe.pdf_reports import PdfGenerationError, build_stage_pdf
+        from scavibe.pdf_reports import PdfGenerationError, STAGE_ACCENTS, generate_pdf_report
+        from scavibe.reporting import STAGE_AUDIT_LABELS
     except ModuleNotFoundError as error:
         if error.name in {"reportlab", "PIL"}:
             raise HTTPException(status_code=503, detail="reportlab==5.0.0 and pillow==12.3.0 are required for PDF exports") from error
         raise
     try:
-        return build_stage_pdf(report, legal_drafts=legal_drafts)
+        return generate_pdf_report(report, STAGE_ACCENTS[report.stage], STAGE_AUDIT_LABELS[report.stage])
     except PdfGenerationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
@@ -1057,16 +966,9 @@ async def download_security_pdf(request: StagePdfRequest) -> StreamingResponse:
 
 
 @app.post("/audit-stages/legal/pdf")
-async def download_legal_pdf(request: LegalArtifactRequest) -> StreamingResponse:
+async def download_legal_pdf(request: StagePdfRequest) -> StreamingResponse:
     _require_pdf_stage(request.report, Stage.LEGAL)
-    artifacts = _legal_artifact_files(request.report, request.jurisdictions)
-    return _pdf_response(
-        _stage_pdf_bytes(
-            request.report,
-            legal_drafts=(artifacts["DRAFT_PRIVACY_POLICY.md"], artifacts["DRAFT_TERMS_OF_SERVICE.md"]),
-        ),
-        "scavibe-legal-audit-and-drafts.pdf",
-    )
+    return _pdf_response(_stage_pdf_bytes(request.report), "scavibe-data-handling-and-consent-audit.pdf")
 
 
 @app.post("/audit-stages/pdf-archive")
@@ -1075,7 +977,6 @@ async def download_audit_pdf_archive(request: AuditPdfArchiveRequest) -> Streami
     _require_pdf_stage(request.performance, Stage.PERFORMANCE)
     _require_pdf_stage(request.security, Stage.SECURITY)
     _require_pdf_stage(request.legal, Stage.LEGAL)
-    legal_artifacts = _legal_artifact_files(request.legal, request.jurisdictions)
     archive = BytesIO()
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
         zip_file.writestr(
@@ -1087,14 +988,8 @@ async def download_audit_pdf_archive(request: AuditPdfArchiveRequest) -> Streami
             _stage_pdf_bytes(request.security),
         )
         zip_file.writestr(
-            "scavibe-legal-audit-and-drafts.pdf",
-            _stage_pdf_bytes(
-                request.legal,
-                legal_drafts=(
-                    legal_artifacts["DRAFT_PRIVACY_POLICY.md"],
-                    legal_artifacts["DRAFT_TERMS_OF_SERVICE.md"],
-                ),
-            ),
+            "scavibe-data-handling-and-consent-audit.pdf",
+            _stage_pdf_bytes(request.legal),
         )
     archive.seek(0)
     return StreamingResponse(
@@ -1104,23 +999,23 @@ async def download_audit_pdf_archive(request: AuditPdfArchiveRequest) -> Streami
     )
 
 
-@app.post("/audit-stages/legal-artifacts")
-async def download_legal_artifacts(request: LegalArtifactRequest) -> StreamingResponse:
+@app.post("/audit-stages/consent-example")
+async def download_consent_example(request: ConsentExampleRequest) -> StreamingResponse:
     _require_pdf_stage(request.report, Stage.LEGAL)
     archive = BytesIO()
     with ZipFile(archive, "w", compression=ZIP_DEFLATED) as zip_file:
-        zip_file.writestr("ConsentCheckbox.tsx", _legal_artifact_files(request.report, request.jurisdictions)["ConsentCheckbox.tsx"])
+        zip_file.writestr("ConsentCheckbox.tsx", _consent_example_files()["ConsentCheckbox.tsx"])
     archive.seek(0)
     return StreamingResponse(
         archive,
         media_type="application/zip",
-        headers={"Content-Disposition": "attachment; filename=scavibe-consent-component.zip"},
+        headers={"Content-Disposition": "attachment; filename=scavibe-consent-checkbox-example.zip"},
     )
 
 
 @app.post("/audit-stages/pull-request", response_model=PullRequestResponse)
 async def create_document_pull_request(request: PullRequestRequest) -> PullRequestResponse:
-    """Open a draft PR containing reports and legal drafts, never direct source edits."""
+    """Open an approved artifact PR; it never applies application source edits."""
     if request.approved is not True:
         raise HTTPException(status_code=422, detail="approved=true is required before Scavibe opens a pull request")
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
@@ -1148,8 +1043,12 @@ async def create_document_pull_request(request: PullRequestRequest) -> PullReque
         )
         if branch_response.status_code != 201:
             raise HTTPException(status_code=502, detail=f"GitHub branch creation returned HTTP {branch_response.status_code}")
-        files = {f"scavibe-audit/{path}": content for path, content in _legal_artifact_files(request.report, request.jurisdictions).items()}
-        if request.report.stage != Stage.LEGAL:
+        if request.report.stage == Stage.LEGAL:
+            files = {
+                "scavibe-audit/SCAVIBE_DATA_HANDLING_AND_CONSENT_AUDIT.md": report_markdown(request.report),
+                "scavibe-audit/ConsentCheckbox.tsx": _consent_example_files()["ConsentCheckbox.tsx"],
+            }
+        else:
             files = {"scavibe-audit/SCAVIBE_AUDIT_REPORT.md": report_markdown(request.report)}
         for path, content in files.items():
             content_response = await client.put(
@@ -1165,11 +1064,113 @@ async def create_document_pull_request(request: PullRequestRequest) -> PullReque
         pull_response = await client.post(
             f"https://api.github.com/repos/{owner}/{repository}/pulls",
             json={
-                "title": f"Scavibe {request.report.stage.value} audit artifacts",
+                "title": (
+                    "Scavibe data-handling and consent audit artifacts"
+                    if request.report.stage == Stage.LEGAL
+                    else f"Scavibe {request.report.stage.value} audit artifacts"
+                ),
                 "head": branch,
                 "base": base_branch,
                 "draft": True,
-                "body": "This draft PR was explicitly approved in Scavibe. It contains audit reports and legal draft artifacts only; it does not modify application source code.",
+                "body": "This draft PR was explicitly approved in Scavibe. It contains evidence-backed audit artifacts and does not modify existing application source code.",
+            },
+        )
+        if pull_response.status_code != 201:
+            raise HTTPException(status_code=502, detail=f"GitHub pull request creation returned HTTP {pull_response.status_code}")
+    return PullRequestResponse(url=pull_response.json()["html_url"], branch=branch)
+
+
+@app.post("/audit-stages/source-fix-pull-request", response_model=PullRequestResponse)
+async def create_source_fix_pull_request(request: SourceFixPullRequestRequest) -> PullRequestResponse:
+    """Open one explicitly approved, two-file additive source-fix PR."""
+    if request.source_change_approved is not True:
+        raise HTTPException(status_code=422, detail="source_change_approved=true is required before Scavibe generates source code")
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if not github_token:
+        raise HTTPException(status_code=503, detail="GITHUB_TOKEN is required to create a pull request")
+    stage_request = StageAuditRequest(
+        repository_url=request.repository_url,
+        app_url=request.app_url,
+        audit_id=request.audit_id,
+        audit_pin=request.audit_pin,
+    )
+    snapshot, audit_id, _ = await _pinned_repository_snapshot(stage_request, [])
+    if request.report.evidence_commit_sha != snapshot.context.commit_sha:
+        raise HTTPException(status_code=422, detail="report evidence_commit_sha does not match the signed audit pin")
+    try:
+        plan = build_auto_fix_plan(request.report, request.finding_index, snapshot.context.source_files)
+    except AutoFixPlanError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if plan.fix_type != request.fix_type:
+        raise HTTPException(status_code=422, detail="fix_type does not match the only bounded source-fix plan supported by this finding")
+    try:
+        owner, repository = parse_github_repository(str(request.repository_url))
+    except RepositoryIntakeError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    headers = {"Authorization": f"Bearer {github_token}", "Accept": "application/vnd.github+json"}
+    timeout = httpx.Timeout(20.0, connect=10.0)
+    branch = f"scavibe/fix-{uuid4().hex[:12]}"
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+        repository_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}")
+        if repository_response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"GitHub repository request returned HTTP {repository_response.status_code}")
+        base_branch = repository_response.json().get("default_branch")
+        ref_response = await client.get(f"https://api.github.com/repos/{owner}/{repository}/git/ref/heads/{base_branch}")
+        if ref_response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"GitHub base branch request returned HTTP {ref_response.status_code}")
+        base_sha = ref_response.json().get("object", {}).get("sha")
+        existing_shas: dict[str, str] = {}
+        for file in plan.files:
+            if file.original_content is None:
+                continue
+            existing_response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repository}/contents/{file.path}",
+                params={"ref": base_branch},
+            )
+            if existing_response.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"GitHub integration file request for {file.path} returned HTTP {existing_response.status_code}")
+            payload = existing_response.json()
+            try:
+                current_content = b64decode(payload["content"].encode("ascii")).decode("utf-8")
+                existing_shas[file.path] = payload["sha"]
+            except (KeyError, UnicodeError, ValueError) as error:
+                raise HTTPException(status_code=502, detail=f"GitHub integration file payload for {file.path} is invalid") from error
+            if current_content != file.original_content:
+                raise HTTPException(status_code=409, detail=f"GitHub integration file {file.path} changed after the pinned audit; rerun the audit before generating a fix")
+        branch_response = await client.post(
+            f"https://api.github.com/repos/{owner}/{repository}/git/refs",
+            json={"ref": f"refs/heads/{branch}", "sha": base_sha},
+        )
+        if branch_response.status_code != 201:
+            raise HTTPException(status_code=502, detail=f"GitHub branch creation returned HTTP {branch_response.status_code}")
+        for file in plan.files:
+            payload = {
+                "message": f"Add Scavibe {plan.fix_type} fix",
+                "content": b64encode(file.content.encode("utf-8")).decode("ascii"),
+                "branch": branch,
+            }
+            if file.original_content is not None:
+                payload["sha"] = existing_shas[file.path]
+            content_response = await client.put(f"https://api.github.com/repos/{owner}/{repository}/contents/{file.path}", json=payload)
+            if content_response.status_code not in {200, 201}:
+                raise HTTPException(status_code=502, detail=f"GitHub file update for {file.path} returned HTTP {content_response.status_code}")
+        pull_response = await client.post(
+            f"https://api.github.com/repos/{owner}/{repository}/pulls",
+            json={
+                "title": f"Scavibe auto-fix: {plan.label}",
+                "head": branch,
+                "base": base_branch,
+                "draft": True,
+                "body": (
+                    f"This draft PR was explicitly approved for the cited finding at `{plan.citation}`.\n\n"
+                    f"It changes exactly two files: one new additive implementation file and one minimal integration edit.\n\n"
+                    f"{plan.verification_note}\n\n"
+                    + (
+                        "Rate-limit default: 60 requests per 60 seconds per IP. This is a conservative starting point and must be reviewed for the product's traffic profile."
+                        if plan.fix_type == "rate_limit_middleware"
+                        else "The generated checkbox is a UI pattern only; review its wording and the surrounding consent flow before merging."
+                    )
+                ),
             },
         )
         if pull_response.status_code != 201:

@@ -28,6 +28,10 @@ MAX_DURATION_SECONDS = 300
 REQUEST_TIMEOUT_SECONDS = 10.0
 EXPLORATORY_DURATION_SECONDS = 12
 RAMP_CONCURRENT_USERS = (10, 25, 50, 75, 100, 125, 150, 175, 200)
+LOAD_TEST_HTTP_LIMITS = httpx.Limits(
+    max_connections=MAX_CONCURRENT_USERS + 50,
+    max_keepalive_connections=MAX_CONCURRENT_USERS + 50,
+)
 
 
 def _monotonic() -> float:
@@ -75,13 +79,17 @@ class BreakingPointFoundEvent(TypedDict):
     threshold: float
 
 
+class CandidateDiscardedEvent(TypedDict):
+    type: Literal["candidate_discarded"]
+
+
 class RampCompletedEvent(TypedDict):
     type: Literal["ramp_completed"]
     tested_range: list[int]
     breaking_point_concurrent_users: int | None
 
 
-RampEvent: TypeAlias = StepStartedEvent | SampleTickEvent | StepCompletedEvent | BreakingPointFoundEvent | RampCompletedEvent
+RampEvent: TypeAlias = StepStartedEvent | SampleTickEvent | StepCompletedEvent | BreakingPointFoundEvent | CandidateDiscardedEvent | RampCompletedEvent
 RampEventCallback: TypeAlias = Callable[[RampEvent], Awaitable[None]]
 
 
@@ -158,7 +166,12 @@ async def run_sandbox_load_test(*, sandbox_url: str, concurrent_users: int, dura
                 async with lock:
                     failures += 1
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "ScavibeSandboxLoadTest/0.1"}) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        limits=LOAD_TEST_HTTP_LIMITS,
+        follow_redirects=True,
+        headers={"User-Agent": "ScavibeSandboxLoadTest/0.1"},
+    ) as client:
         await asyncio.gather(*(worker(client) for _ in range(concurrent_users)))
     samples = len(latencies) + failures
     if samples < 20 or not latencies:
@@ -249,7 +262,12 @@ async def _run_ramp_step(
             if tick is not None:
                 await on_event(tick)
 
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": "ScavibeSandboxRampTest/0.1"}) as client:
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        limits=LOAD_TEST_HTTP_LIMITS,
+        follow_redirects=True,
+        headers={"User-Agent": "ScavibeSandboxRampTest/0.1"},
+    ) as client:
         await asyncio.gather(*(worker(client) for _ in range(concurrent_users)))
     sample_count = successful_requests + failed_requests
     if sample_count == 0:
@@ -274,8 +292,48 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
     """Run nine 12-second exploratory steps and one 60-second confirmation step."""
     target = validate_sandbox_url(sandbox_url)
     exploratory_steps: list[RampStepResult] = []
-    candidate_step: RampStepResult | None = None
-    candidate_breach: tuple[Literal["p95_latency_ms", "error_rate_percent"], float, float] | None = None
+    final_confirmation: RampStepResult | None = None
+    confirmed_breach: tuple[Literal["p95_latency_ms", "error_rate_percent"], float, float] | None = None
+    last_exploratory_breach: tuple[str, float, float] | None = None
+    last_discarded_confirmation: RampStepResult | None = None
+
+    async def confirm(step: RampStepResult) -> tuple[RampStepResult, tuple[Literal["p95_latency_ms", "error_rate_percent"], float, float] | None]:
+        await on_event(
+            {
+                "type": "step_started",
+                "phase": "confirmation",
+                "step_index": step.step_index,
+                "concurrent_users": step.concurrent_users,
+                "planned_duration_seconds": PERFORMANCE_MIN_DURATION_SECONDS,
+            }
+        )
+        confirmation = await _run_ramp_step(
+            target=target,
+            phase="confirmation",
+            step_index=step.step_index,
+            concurrent_users=step.concurrent_users,
+            duration_seconds=PERFORMANCE_MIN_DURATION_SECONDS,
+            on_event=on_event,
+        )
+        if confirmation.sample_count < PERFORMANCE_MIN_SAMPLE_COUNT:
+            raise LoadTestError(
+                f"ramp confirmation step {confirmation.step_index} at {confirmation.concurrent_users} concurrent users produced {confirmation.sample_count} samples; at least {PERFORMANCE_MIN_SAMPLE_COUNT} are required"
+            )
+        confirmation_breach = _breach_details(confirmation)
+        await on_event(
+            {
+                "type": "step_completed",
+                "phase": "confirmation",
+                "step_index": confirmation.step_index,
+                "concurrent_users": confirmation.concurrent_users,
+                "p95_latency_ms": confirmation.p95_latency_ms,
+                "error_rate_percent": confirmation.error_rate_percent,
+                "sample_count": confirmation.sample_count,
+                "breached": confirmation_breach is not None,
+            }
+        )
+        return confirmation, confirmation_breach
+
     for step_index, concurrent_users in enumerate(RAMP_CONCURRENT_USERS):
         await on_event(
             {
@@ -296,6 +354,7 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
         )
         exploratory_steps.append(step)
         breach = _breach_details(step)
+        last_exploratory_breach = breach
         await on_event(
             {
                 "type": "step_completed",
@@ -309,58 +368,52 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
             }
         )
         if breach is not None:
-            metric, observed_value, threshold = breach
-            if metric == "p95_latency_ms" and step.p95_latency_ms is None:
+            confirmation, confirmation_breach = await confirm(step)
+            if confirmation_breach is None:
+                last_discarded_confirmation = confirmation
+                await on_event({"type": "candidate_discarded"})
+                continue
+            metric, observed_value, threshold = confirmation_breach
+            if metric == "p95_latency_ms" and confirmation.p95_latency_ms is None:
                 raise AssertionError("p95_latency_ms cannot be a breach metric when no successful sample exists")
-            if step.p95_latency_ms is None and metric != "error_rate_percent":
+            if confirmation.p95_latency_ms is None and metric != "error_rate_percent":
                 raise AssertionError("a null p95 latency breach must use error_rate_percent")
             await on_event(
                 {
                     "type": "breaking_point_found",
-                    "concurrent_users": concurrent_users,
+                    "concurrent_users": confirmation.concurrent_users,
                     "metric": metric,
                     "observed_value": observed_value,
                     "threshold": threshold,
                 }
             )
-            candidate_step = step
-            candidate_breach = (metric, observed_value, threshold)
+            final_confirmation = confirmation
+            confirmed_breach = confirmation_breach
             break
-    confirmation_step = candidate_step or exploratory_steps[-1]
-    await on_event(
-        {
-            "type": "step_started",
-            "phase": "confirmation",
-            "step_index": confirmation_step.step_index,
-            "concurrent_users": confirmation_step.concurrent_users,
-            "planned_duration_seconds": PERFORMANCE_MIN_DURATION_SECONDS,
-        }
-    )
-    confirmation = await _run_ramp_step(
-        target=target,
-        phase="confirmation",
-        step_index=confirmation_step.step_index,
-        concurrent_users=confirmation_step.concurrent_users,
-        duration_seconds=PERFORMANCE_MIN_DURATION_SECONDS,
-        on_event=on_event,
-    )
-    if confirmation.sample_count < PERFORMANCE_MIN_SAMPLE_COUNT:
-        raise LoadTestError(
-            f"ramp confirmation step {confirmation.step_index} at {confirmation.concurrent_users} concurrent users produced {confirmation.sample_count} samples; at least {PERFORMANCE_MIN_SAMPLE_COUNT} are required"
-        )
-    confirmation_breach = _breach_details(confirmation)
-    await on_event(
-        {
-            "type": "step_completed",
-            "phase": "confirmation",
-            "step_index": confirmation.step_index,
-            "concurrent_users": confirmation.concurrent_users,
-            "p95_latency_ms": confirmation.p95_latency_ms,
-            "error_rate_percent": confirmation.error_rate_percent,
-            "sample_count": confirmation.sample_count,
-            "breached": confirmation_breach is not None,
-        }
-    )
+    if final_confirmation is None:
+        final_exploratory_step = exploratory_steps[-1]
+        if (
+            final_exploratory_step.step_index == 8
+            and final_exploratory_step.concurrent_users == MAX_CONCURRENT_USERS
+            and last_exploratory_breach is not None
+            and last_discarded_confirmation is not None
+        ):
+            final_confirmation = last_discarded_confirmation
+        else:
+            final_confirmation, final_confirmation_breach = await confirm(final_exploratory_step)
+            if final_confirmation_breach is not None:
+                metric, observed_value, threshold = final_confirmation_breach
+                await on_event(
+                    {
+                        "type": "breaking_point_found",
+                        "concurrent_users": final_confirmation.concurrent_users,
+                        "metric": metric,
+                        "observed_value": observed_value,
+                        "threshold": threshold,
+                    }
+                )
+                confirmed_breach = final_confirmation_breach
+    confirmation = final_confirmation
     measurement = RuntimeMeasurement(
         id=f"ramp_{int(time.time())}_{confirmation.concurrent_users}",
         target_mode="sandbox",
@@ -376,14 +429,14 @@ async def run_ramp_load_test(*, sandbox_url: str, on_event: RampEventCallback) -
         {
             "type": "ramp_completed",
             "tested_range": [MIN_CONCURRENT_USERS, MAX_CONCURRENT_USERS],
-            "breaking_point_concurrent_users": candidate_step.concurrent_users if candidate_step else None,
+            "breaking_point_concurrent_users": confirmation.concurrent_users if confirmed_breach else None,
         }
     )
     return RampResult(
         exploratory_steps=tuple(exploratory_steps),
         confirmation_measurement=measurement,
-        breaking_point_concurrent_users=candidate_step.concurrent_users if candidate_step else None,
-        breaking_point_metric=candidate_breach[0] if candidate_breach else None,
-        breaking_point_observed_value=candidate_breach[1] if candidate_breach else None,
-        breaking_point_threshold=candidate_breach[2] if candidate_breach else None,
+        breaking_point_concurrent_users=confirmation.concurrent_users if confirmed_breach else None,
+        breaking_point_metric=confirmed_breach[0] if confirmed_breach else None,
+        breaking_point_observed_value=confirmed_breach[1] if confirmed_breach else None,
+        breaking_point_threshold=confirmed_breach[2] if confirmed_breach else None,
     )

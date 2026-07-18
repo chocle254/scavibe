@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .contracts import AgentReport, Evidence, EvidenceKind
+from .contracts import AgentReport, Evidence, EvidenceKind, Stage
+
+
+STAGE_AUDIT_LABELS = {
+    Stage.PERFORMANCE: "Performance audit",
+    Stage.SECURITY: "Security audit",
+    Stage.LEGAL: "Data-handling and consent audit",
+}
 
 
 def format_evidence_markdown(evidence: Evidence) -> str:
@@ -19,7 +26,7 @@ def format_evidence_markdown(evidence: Evidence) -> str:
 
 def report_markdown(report: AgentReport) -> str:
     """Create the evidence-backed Markdown representation of an AgentReport."""
-    lines = [f"# Scavibe {report.stage.value.title()} Audit", "", report.summary, "", "## Findings", ""]
+    lines = [f"# Scavibe {STAGE_AUDIT_LABELS[report.stage]}", "", report.summary, "", "## Findings", ""]
     if not report.findings:
         lines.extend(["No evidence-backed findings were returned for the supplied evidence set.", ""])
     for finding in report.findings:

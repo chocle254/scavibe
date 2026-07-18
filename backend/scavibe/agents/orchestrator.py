@@ -7,7 +7,7 @@ from .base import SpecialistAgent
 from .gateway import AgentProtocolError, Gateway
 from .legal_agent import LEGAL_DISCLAIMER, LEGAL_PROMPT, validate_legal_finding
 from .performance_agent import PERFORMANCE_PROMPT, validate_performance_finding
-from .security_agent import SECURITY_PROMPT, validate_security_finding
+from .security_agent import SECURITY_PROMPT, prepare_security_context, validate_security_finding
 from .thresholds import PERFORMANCE_MIN_CONCURRENT_USERS, PERFORMANCE_MIN_DURATION_SECONDS, PERFORMANCE_MIN_SAMPLE_COUNT
 
 
@@ -17,7 +17,14 @@ class AuditOrchestrator:
     def __init__(self, gateway: Gateway) -> None:
         self._agents = {
             Stage.PERFORMANCE: SpecialistAgent(Stage.PERFORMANCE, gateway, system_prompt=PERFORMANCE_PROMPT, stage_validator=validate_performance_finding),
-            Stage.SECURITY: SpecialistAgent(Stage.SECURITY, gateway, system_prompt=SECURITY_PROMPT, stage_validator=validate_security_finding),
+            Stage.SECURITY: SpecialistAgent(
+                Stage.SECURITY,
+                gateway,
+                system_prompt=SECURITY_PROMPT,
+                stage_validator=validate_security_finding,
+                context_preparer=prepare_security_context,
+                include_runtime_measurements=False,
+            ),
             Stage.LEGAL: SpecialistAgent(Stage.LEGAL, gateway, system_prompt=LEGAL_PROMPT, stage_validator=validate_legal_finding, required_limitation=LEGAL_DISCLAIMER),
         }
 

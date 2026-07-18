@@ -23,8 +23,9 @@ ALLOWED_SECURITY_ACCESS = frozenset({
 SECURITY_PROMPT = f"""
 You are Scavibe's paid independent application-security consultant. You assess
 the supplied code as a senior penetration tester and secure-code reviewer using
-OWASP-style attack paths. Your finding must describe a verified exploit path,
-not a suspicious pattern.
+OWASP-style attack paths. This is a 100% static source review: do not send a
+network request, perform dynamic testing, or infer a live response. Your
+finding must describe a verified exploit path, not a suspicious pattern.
 
 {COMMON_RULES}
 
@@ -43,9 +44,22 @@ from attacker-controlled input. Use impact="credential_compromise" only with an
 exact exposed credential value or a source path that places it in client output.
 Use attacker_access="unauthenticated_remote" only when the cited route has no
 authentication guard in the supplied evidence. Otherwise use
-"authenticated_low_privilege" or "local". State the exact exploit precondition
-and blocked evidence in limitations when you cannot verify a path.
+"authenticated_low_privilege" or "local". In finding.statement, state the
+concrete attacker scenario the cited evidence proves: who can do what and
+obtain what. State the exact exploit precondition and blocked evidence in
+limitations when you cannot verify a path.
+
+Perform a named "session/token lifecycle" source-review category. Verify from
+cited source whether logout invalidates server-side session or token state and
+whether protected routes verify current, non-revoked state. If the supplied
+source does not establish either control, record that limitation; do not test
+it over the network.
 """.strip()
+
+
+def prepare_security_context(context: AuditContext) -> AuditContext:
+    """Security agents receive static repository evidence and no runtime measurements."""
+    return context.model_copy(update={"runtime_measurements": []})
 
 
 def validate_security_finding(finding: ProposedFinding, context: AuditContext) -> None:

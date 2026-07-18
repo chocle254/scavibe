@@ -18,7 +18,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
-    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -27,7 +26,7 @@ from reportlab.platypus import (
 )
 
 from .contracts import AgentReport, Finding, Stage
-from .reporting import format_evidence_markdown
+from .reporting import STAGE_AUDIT_LABELS, format_evidence_markdown
 
 
 class PdfGenerationError(RuntimeError):
@@ -148,28 +147,6 @@ def _styles() -> dict[str, ParagraphStyle]:
             textColor=_color(PAGE_BACKGROUND),
             alignment=TA_LEFT,
         ),
-        "document_heading": ParagraphStyle(
-            "ScavibeDocumentHeading",
-            parent=base["Heading2"],
-            fontName=FONT_BOLD,
-            fontSize=17,
-            leading=21,
-            textColor=_color(BODY_TEXT),
-            spaceBefore=8,
-            spaceAfter=8,
-            wordWrap="CJK",
-        ),
-        "document_body": ParagraphStyle(
-            "ScavibeDocumentBody",
-            parent=base["BodyText"],
-            fontName=FONT_REGULAR,
-            fontSize=8.4,
-            leading=12,
-            textColor=_color(BODY_TEXT),
-            spaceAfter=4,
-            wordWrap="CJK",
-            splitLongWords=True,
-        ),
         "footer": ParagraphStyle(
             "ScavibeFooter",
             parent=base["Normal"],
@@ -232,29 +209,6 @@ def _finding_flowables(finding: Finding, styles: dict[str, ParagraphStyle], cont
     return [_panel(card_content, content_width), Spacer(1, 9)]
 
 
-def _append_legal_document(
-    story: list[object],
-    *,
-    title: str,
-    document: str,
-    styles: dict[str, ParagraphStyle],
-) -> None:
-    story.append(PageBreak())
-    story.append(_paragraph(title, styles["document_heading"]))
-    story.append(HRFlowable(width="100%", thickness=1, color=_color(LEGAL_ACCENT), spaceAfter=9))
-    for line in document.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            story.append(Spacer(1, 4))
-        elif stripped.startswith("#"):
-            heading = stripped.lstrip("#").strip()
-            story.append(_paragraph(heading, styles["document_heading"]))
-        elif stripped.startswith("- "):
-            story.append(_paragraph(f"• {stripped[2:]}", styles["document_body"]))
-        else:
-            story.append(_paragraph(stripped, styles["document_body"]))
-
-
 def _draw_page(accent: str):
     def draw(canvas, document) -> None:
         canvas.saveState()
@@ -272,14 +226,10 @@ def _draw_page(accent: str):
     return draw
 
 
-def build_stage_pdf(
-    report: AgentReport,
-    *,
-    legal_drafts: tuple[str, str] | None = None,
-) -> bytes:
-    """Render one report, plus legal publication drafts when supplied, to PDF bytes."""
+def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str) -> bytes:
+    """Render one evidence-backed audit report from the supplied AgentReport only."""
     _register_fonts()
-    accent = STAGE_ACCENTS[report.stage]
+    accent = stage_color
     styles = _styles()
     buffer = BytesIO()
     document = SimpleDocTemplate(
@@ -289,7 +239,7 @@ def build_stage_pdf(
         rightMargin=18 * mm,
         topMargin=24 * mm,
         bottomMargin=18 * mm,
-        title=f"Scavibe {report.stage.value.title()} Audit",
+        title=f"Scavibe {stage_label}",
         author="Scavibe",
     )
     content_width = A4[0] - document.leftMargin - document.rightMargin
@@ -299,7 +249,7 @@ def build_stage_pdf(
     timestamp = generated_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     story: list[object] = [
         _paragraph("SCAVIBE · VERIFIED AUDIT", styles["eyebrow"]),
-        _paragraph(f"{report.stage.value.title()} report", styles["title"]),
+        _paragraph(stage_label, styles["title"]),
         HRFlowable(width="100%", thickness=1.3, color=_color(accent), spaceAfter=10),
         _panel(
             [
@@ -314,11 +264,11 @@ def build_stage_pdf(
     if report.ramp_assessment is not None:
         assessment = report.ramp_assessment
         if assessment.breaking_point_concurrent_users is None:
-            ramp_text = "Ramp result: no breaking point identified within the tested range of 10 to 200 concurrent users."
+            ramp_text = "Confirmed ramp result: no breaking point identified within the tested range of 10 to 200 concurrent users."
         else:
             ramp_text = (
-                f"Ramp result: first exploratory breach at {assessment.breaking_point_concurrent_users} concurrent users; "
-                f"{assessment.metric}={assessment.observed_value} against threshold={assessment.threshold}."
+                f"Confirmed ramp breaking point: {assessment.metric}={assessment.observed_value} against "
+                f"threshold={assessment.threshold} at {assessment.breaking_point_concurrent_users} concurrent users."
             )
         story.extend([_paragraph("Load ramp confirmation", styles["section"]), _panel([_paragraph(ramp_text, styles["body"])], content_width)])
     if report.findings:
@@ -329,9 +279,10 @@ def build_stage_pdf(
     story.append(_paragraph("Limitations", styles["section"]))
     limitation_lines = [_paragraph(f"• {limitation}", styles["body"]) for limitation in report.limitations]
     story.append(_panel(limitation_lines, content_width))
-    if legal_drafts is not None:
-        privacy_policy, terms_of_service = legal_drafts
-        _append_legal_document(story, title="Draft Privacy Policy", document=privacy_policy, styles=styles)
-        _append_legal_document(story, title="Draft Terms of Service", document=terms_of_service, styles=styles)
     document.build(story, onFirstPage=_draw_page(accent), onLaterPages=_draw_page(accent))
     return buffer.getvalue()
+
+
+def build_stage_pdf(report: AgentReport) -> bytes:
+    """Compatibility wrapper for callers that select a standard Scavibe stage palette."""
+    return generate_pdf_report(report, STAGE_ACCENTS[report.stage], STAGE_AUDIT_LABELS[report.stage])

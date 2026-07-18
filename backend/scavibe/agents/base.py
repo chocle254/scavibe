@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -39,12 +40,28 @@ not present in the input.
 State only verified facts in finding.statement. If evidence is incomplete,
 record the limitation and omit the finding. Never propose or apply a code,
 configuration, deployment, or repository change.
+
+State the exact required fix in finding.remediation — name the specific file,
+function, or configuration value that must change and describe the corrected
+behavior precisely enough for an engineer to implement it without further
+research. Never author, generate, or apply the actual code diff, configuration
+file, or pull request yourself — describe the fix, do not write it.
 """.strip()
 
 MAX_AGENT_INPUT_JSON_CHARACTERS = 280_000
 MAX_AGENT_SOURCE_FILES = 60
 MAX_AGENT_FORMAT_ATTEMPTS = 2
 StageValidator = Callable[[ProposedFinding, AuditContext], None]
+ContextPreparer = Callable[[AuditContext], AuditContext]
+AgentPhaseCallback = Callable[
+    [Literal["phase_started", "phase_completed"], Literal["specialist_analysis", "evidence_validation"]],
+    Awaitable[None],
+]
+
+
+def identity_context(context: AuditContext) -> AuditContext:
+    """Return the supplied context unchanged for stages that need all evidence kinds."""
+    return context
 
 
 def _parse_agent_json(raw_output: str, stage: Stage) -> dict:
@@ -66,9 +83,12 @@ def _parse_agent_json(raw_output: str, stage: Stage) -> dict:
     return payload
 
 
-def serialize_context(context: AuditContext) -> str:
+def serialize_context(context: AuditContext, *, include_runtime_measurements: bool = True) -> str:
     """Use JSON to preserve exact paths, lines, metrics, and target mode."""
-    return context.model_dump_json(exclude_none=True)
+    payload = context.model_dump(mode="json", exclude_none=True)
+    if not include_runtime_measurements:
+        payload.pop("runtime_measurements", None)
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _source_priority(stage: Stage, path: str, original_index: int) -> tuple[int, int]:
@@ -82,7 +102,12 @@ def _source_priority(stage: Stage, path: str, original_index: int) -> tuple[int,
     return (0 if any(keyword in lower for keyword in keywords) else 1, original_index)
 
 
-def context_for_agent(stage: Stage, context: AuditContext) -> tuple[AuditContext, int]:
+def context_for_agent(
+    stage: Stage,
+    context: AuditContext,
+    *,
+    include_runtime_measurements: bool = True,
+) -> tuple[AuditContext, int]:
     """Keep complete files within a 280,000-character serialized input cap."""
     ordered = sorted(enumerate(context.source_files), key=lambda item: _source_priority(stage, item[1].path, item[0]))
     selected = []
@@ -90,7 +115,12 @@ def context_for_agent(stage: Stage, context: AuditContext) -> tuple[AuditContext
         if len(selected) >= MAX_AGENT_SOURCE_FILES:
             continue
         candidate = context.model_copy(update={"source_files": [*selected, source], "source_content_complete": False})
-        if len(serialize_context(candidate)) <= MAX_AGENT_INPUT_JSON_CHARACTERS:
+        if len(
+            serialize_context(
+                candidate,
+                include_runtime_measurements=include_runtime_measurements,
+            )
+        ) <= MAX_AGENT_INPUT_JSON_CHARACTERS:
             selected.append(source)
     if not selected:
         raise AgentProtocolError(
@@ -170,22 +200,47 @@ class SpecialistAgent:
         system_prompt: str | None = None,
         stage_validator: StageValidator | None = None,
         required_limitation: str | None = None,
+        context_preparer: ContextPreparer | None = None,
+        include_runtime_measurements: bool = True,
     ) -> None:
-        if system_prompt is None or stage_validator is None:
+        if system_prompt is None or stage_validator is None or context_preparer is None:
             from . import stage_configuration_for
 
-            system_prompt, stage_validator, required_limitation = stage_configuration_for(stage)
+            (
+                configured_prompt,
+                configured_validator,
+                configured_limitation,
+                configured_context_preparer,
+                configured_runtime_measurements,
+            ) = stage_configuration_for(stage)
+            system_prompt = system_prompt or configured_prompt
+            stage_validator = stage_validator or configured_validator
+            required_limitation = required_limitation if required_limitation is not None else configured_limitation
+            context_preparer = context_preparer or configured_context_preparer
+            include_runtime_measurements = configured_runtime_measurements
         self._stage = stage
         self._gateway = gateway
         self._system_prompt = system_prompt
         self._stage_validator = stage_validator
         self._required_limitation = required_limitation
+        self._context_preparer = context_preparer or identity_context
+        self._include_runtime_measurements = include_runtime_measurements
 
-    async def analyze(self, context: AuditContext) -> AgentReport:
-        agent_context, omitted_file_count = context_for_agent(self._stage, context)
-        input_json = serialize_context(agent_context)
+    async def analyze(self, context: AuditContext, *, on_phase: AgentPhaseCallback | None = None) -> AgentReport:
+        prepared_context = self._context_preparer(context)
+        agent_context, omitted_file_count = context_for_agent(
+            self._stage,
+            prepared_context,
+            include_runtime_measurements=self._include_runtime_measurements,
+        )
+        input_json = serialize_context(
+            agent_context,
+            include_runtime_measurements=self._include_runtime_measurements,
+        )
         payload: dict | None = None
         format_error: AgentProtocolError | None = None
+        if on_phase is not None:
+            await on_phase("phase_started", "specialist_analysis")
         for attempt in range(MAX_AGENT_FORMAT_ATTEMPTS):
             repair_instruction = "" if attempt == 0 else (
                 "\nFORMAT REPAIR: Your prior response was rejected because it was not one complete AgentDraft JSON object. "
@@ -210,9 +265,14 @@ class SpecialistAgent:
             draft = AgentDraft.model_validate(payload)
         except ValidationError as error:
             raise AgentProtocolError(f"{self._stage} response is not a valid AgentDraft: {error}") from error
+        if on_phase is not None:
+            await on_phase("phase_completed", "specialist_analysis")
+            await on_phase("phase_started", "evidence_validation")
         report = validate_draft(self._stage, draft, context, self._stage_validator, self._required_limitation)
         if omitted_file_count:
             report.limitations.append(
                 f"Specialist input contained {len(agent_context.source_files)} of {len(context.source_files)} source files, capped at {MAX_AGENT_INPUT_JSON_CHARACTERS} serialized JSON characters; repository-wide absence claims are invalid."
             )
+        if on_phase is not None:
+            await on_phase("phase_completed", "evidence_validation")
         return report

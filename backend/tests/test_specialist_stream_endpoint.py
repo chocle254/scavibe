@@ -10,7 +10,7 @@ from scavibe.repository import RepositorySnapshot
 
 
 class SpecialistStreamEndpointTests(unittest.IsolatedAsyncioTestCase):
-    async def test_security_stream_emits_selected_source_files_then_pinned_report(self) -> None:
+    async def test_security_stream_emits_only_real_repository_analysis_and_validation_phases(self) -> None:
         audit_id = "audit_security_stream"
         audit_pin = "signed-pinned-audit-token"
         commit_sha = "f" * 40
@@ -37,9 +37,14 @@ class SpecialistStreamEndpointTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(initial_commit_sha)
             return snapshot, audit_id, audit_pin
 
-        async def fake_specialist_report(stage: Stage, context: AuditContext) -> AgentReport:
+        async def fake_specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
             self.assertEqual(stage, Stage.SECURITY)
             self.assertEqual(context.commit_sha, commit_sha)
+            self.assertIsNotNone(on_phase)
+            await on_phase("phase_started", "specialist_analysis")
+            await on_phase("phase_completed", "specialist_analysis")
+            await on_phase("phase_started", "evidence_validation")
+            await on_phase("phase_completed", "evidence_validation")
             return AgentReport(
                 stage=Stage.SECURITY,
                 summary="Security report is based only on the pinned repository source evidence.",
@@ -69,19 +74,28 @@ class SpecialistStreamEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [event["type"] for event in events],
             [
-                "stage_started",
-                "evidence_selected",
-                "file_queued",
-                "file_queued",
-                "analysis_started",
+                "phase_started",
+                "phase_completed",
+                "phase_started",
+                "phase_completed",
+                "phase_started",
+                "phase_completed",
                 "report_ready",
             ],
         )
+        self.assertEqual([event.get("phase") for event in events[:-1]], [
+            "repository_fetch",
+            "repository_fetch",
+            "specialist_analysis",
+            "specialist_analysis",
+            "evidence_validation",
+            "evidence_validation",
+        ])
         self.assertEqual(events[1]["commit_sha"], commit_sha)
         self.assertEqual(events[1]["selected_file_count"], 2)
         self.assertEqual(
-            [event["file_path"] for event in events if event["type"] == "file_queued"],
-            selected_paths,
+            [event for event in events if event["type"] == "file_queued"],
+            [],
         )
 
         final_response = StageAuditResponse.model_validate(events[-1]["result"])
@@ -101,4 +115,4 @@ class SpecialistStreamEndpointTests(unittest.IsolatedAsyncioTestCase):
             await audit_legal_stream(request)
 
         self.assertEqual(raised.exception.status_code, 422)
-        self.assertEqual(raised.exception.detail, "legal requires at least one explicit jurisdiction code")
+        self.assertEqual(raised.exception.detail, "data-handling and consent audit requires at least one explicit jurisdiction code")
