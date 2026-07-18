@@ -19,6 +19,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
     Paragraph,
+    Preformatted,
     SimpleDocTemplate,
     Spacer,
     Table,
@@ -138,6 +139,14 @@ def _styles() -> dict[str, ParagraphStyle]:
             wordWrap="CJK",
             splitLongWords=True,
         ),
+        "code": ParagraphStyle(
+            "ScavibeEvidenceCode",
+            parent=base["Code"],
+            fontName=FONT_REGULAR,
+            fontSize=6.3,
+            leading=7.8,
+            textColor=_color(BODY_TEXT),
+        ),
         "badge": ParagraphStyle(
             "ScavibeBadge",
             parent=base["BodyText"],
@@ -209,6 +218,78 @@ def _finding_flowables(finding: Finding, styles: dict[str, ParagraphStyle], cont
     return [_panel(card_content, content_width), Spacer(1, 9)]
 
 
+def _verbatim_evidence_block(text: str, styles: dict[str, ParagraphStyle]) -> Preformatted:
+    """Render supplied evidence verbatim, without treating source text as PDF markup."""
+    return Preformatted(text, styles["code"], maxLineLength=112)
+
+
+def _numbered_source(content: str) -> str:
+    lines = content.splitlines()
+    if not lines:
+        return "000001 | "
+    return "\n".join(f"{line_number:06d} | {line}" for line_number, line in enumerate(lines, start=1))
+
+
+def _evidence_inventory_flowables(report: AgentReport, styles: dict[str, ParagraphStyle], content_width: float) -> list[object]:
+    inventory = report.evidence_inventory
+    if inventory is None:
+        return [
+            _panel(
+                [_paragraph("This legacy report has no retained evidence inventory. It cannot prove which supplied files, manifest paths, runtime measurements, or jurisdictions were inspected.", styles["body"])],
+                content_width,
+            )
+        ]
+
+    content: list[object] = [
+        _paragraph("Evidence appendix", styles["section"]),
+        _panel(
+            [
+                _paragraph(f"Supplied source files reproduced below: {len(inventory.source_files)}.", styles["body"]),
+                _paragraph(f"Repository manifest paths reproduced below: {len(inventory.repository_paths)}.", styles["body"]),
+                _paragraph(
+                    "Source coverage is complete." if inventory.source_content_complete else "Source coverage is capped; the manifest is complete but only the reproduced source files were supplied for analysis.",
+                    styles["body"],
+                ),
+            ],
+            content_width,
+        ),
+        _paragraph("Repository manifest", styles["section"]),
+        _verbatim_evidence_block("\n".join(inventory.repository_paths) or "(no manifest paths supplied)", styles),
+        Spacer(1, 8),
+        _paragraph("Supplied source files", styles["section"]),
+    ]
+    for source in inventory.source_files:
+        content.extend(
+            [
+                _paragraph(f"Source file: {source.path}", styles["finding"]),
+                _verbatim_evidence_block(_numbered_source(source.content), styles),
+                Spacer(1, 8),
+            ]
+        )
+    content.append(_paragraph("Runtime measurements", styles["section"]))
+    if inventory.runtime_measurements:
+        for measurement in inventory.runtime_measurements:
+            p95 = "null (no successful response latency was measured)" if measurement.p95_latency_ms is None else str(measurement.p95_latency_ms)
+            content.append(
+                _panel(
+                    [
+                        _paragraph(f"Measurement ID: {measurement.id}", styles["body"]),
+                        _paragraph(f"Target mode: {measurement.target_mode}; endpoint: {measurement.endpoint}", styles["body"]),
+                        _paragraph(f"Concurrent users: {measurement.concurrent_users}; duration seconds: {measurement.duration_seconds}", styles["body"]),
+                        _paragraph(f"Completed requests: {measurement.sample_count}; successful requests: {measurement.successful_sample_count}", styles["body"]),
+                        _paragraph(f"P95 latency ms: {p95}; error rate percent: {measurement.error_rate_percent}", styles["body"]),
+                    ],
+                    content_width,
+                )
+            )
+    else:
+        content.append(_panel([_paragraph("No runtime measurement was supplied to this stage.", styles["body"])], content_width))
+    content.append(_paragraph("Declared jurisdictions", styles["section"]))
+    jurisdiction_text = ", ".join(inventory.jurisdictions) if inventory.jurisdictions else "No jurisdiction code was supplied to this stage."
+    content.append(_panel([_paragraph(jurisdiction_text, styles["body"])], content_width))
+    return content
+
+
 def _draw_page(accent: str):
     def draw(canvas, document) -> None:
         canvas.saveState()
@@ -275,10 +356,35 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
         for finding in report.findings:
             story.extend(_finding_flowables(finding, styles, content_width))
     else:
-        story.extend([_panel([_paragraph("No evidence-backed findings were returned for the supplied evidence set.", styles["body"])], content_width), Spacer(1, 8)])
+        story.extend(
+            [
+                _panel(
+                    [
+                        _paragraph("No evidence-backed findings were returned for the supplied evidence set.", styles["body"]),
+                        _paragraph("No code, configuration, security, or legal change is proposed without a verified finding. Review the complete evidence appendix before deciding whether additional evidence is required.", styles["body"]),
+                    ],
+                    content_width,
+                ),
+                Spacer(1, 8),
+            ]
+        )
+    story.append(_paragraph("Remediation plan", styles["section"]))
+    if report.findings:
+        remediation_lines: list[object] = []
+        for finding in report.findings:
+            remediation_lines.extend(
+                [
+                    _paragraph(finding.title, styles["finding"]),
+                    _paragraph(finding.remediation, styles["body"]),
+                ]
+            )
+        story.append(_panel(remediation_lines, content_width))
+    else:
+        story.append(_panel([_paragraph("No remediation is proposed because no finding met the evidence admission rule. Do not apply a speculative fix from this report.", styles["body"])], content_width))
     story.append(_paragraph("Limitations", styles["section"]))
     limitation_lines = [_paragraph(f"• {limitation}", styles["body"]) for limitation in report.limitations]
     story.append(_panel(limitation_lines, content_width))
+    story.extend(_evidence_inventory_flowables(report, styles, content_width))
     document.build(story, onFirstPage=_draw_page(accent), onLaterPages=_draw_page(accent))
     return buffer.getvalue()
 

@@ -122,6 +122,34 @@ class AuditContext(BaseModel):
         return self
 
 
+class EvidenceInventory(BaseModel):
+    """The complete supplied evidence set reproduced in exported audit artifacts."""
+
+    source_files: Annotated[list[SourceFile], Field(max_length=2_000)] = Field(default_factory=list)
+    repository_paths: Annotated[list[str], Field(max_length=10_000)] = Field(default_factory=list)
+    source_content_complete: bool
+    runtime_measurements: list[RuntimeMeasurement] = Field(default_factory=list)
+    jurisdictions: list[Annotated[str, Field(pattern=r"^[A-Z]{2}(-[A-Z]{2})?$")]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def sources_must_be_listed(self) -> "EvidenceInventory":
+        listed = set(self.repository_paths)
+        missing = [file.path for file in self.source_files if file.path not in listed]
+        if missing:
+            raise ValueError(f"evidence inventory source_files absent from repository_paths: {missing}")
+        return self
+
+    @classmethod
+    def from_context(cls, context: AuditContext) -> "EvidenceInventory":
+        return cls(
+            source_files=context.source_files,
+            repository_paths=context.repository_paths,
+            source_content_complete=context.source_content_complete,
+            runtime_measurements=context.runtime_measurements,
+            jurisdictions=context.jurisdictions,
+        )
+
+
 class ProposedFinding(BaseModel):
     """The model supplies facts; deterministic code supplies score and severity."""
 
@@ -172,6 +200,7 @@ class AgentReport(BaseModel):
     limitations: list[str]
     evidence_commit_sha: str
     ramp_assessment: RampAssessment | None = None
+    evidence_inventory: EvidenceInventory | None = None
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

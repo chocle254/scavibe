@@ -27,6 +27,7 @@ from scavibe.contracts import (
     AuditContext,
     AuditRun,
     AttackerAccess,
+    EvidenceInventory,
     Evidence,
     EvidenceKind,
     Finding,
@@ -547,6 +548,9 @@ def _performance_report(
 ) -> AgentReport:
     """Create a deterministic report from measured sandbox values only."""
     measurement = summary.measurement
+    evidence_context = context
+    if not any(item.id == measurement.id for item in context.runtime_measurements):
+        evidence_context = context.model_copy(update={"runtime_measurements": [*context.runtime_measurements, measurement]})
     qualifying_gate_failed = (
         measurement.concurrent_users < PERFORMANCE_MIN_CONCURRENT_USERS
         or measurement.duration_seconds < PERFORMANCE_MIN_DURATION_SECONDS
@@ -580,6 +584,7 @@ def _performance_report(
             limitations=limitations,
             evidence_commit_sha=context.commit_sha,
             ramp_assessment=ramp_assessment,
+            evidence_inventory=EvidenceInventory.from_context(evidence_context),
         )
     findings: list[Finding] = []
     conditions = [
@@ -642,6 +647,7 @@ def _performance_report(
         limitations=limitations,
         evidence_commit_sha=context.commit_sha,
         ramp_assessment=ramp_assessment,
+        evidence_inventory=EvidenceInventory.from_context(evidence_context),
     )
 
 

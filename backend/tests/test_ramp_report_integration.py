@@ -56,6 +56,7 @@ class RampReportIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(report.ramp_assessment)
         self.assertIsNone(report.ramp_assessment.breaking_point_concurrent_users)
+        self.assertEqual(report.evidence_inventory.runtime_measurements, [measurement])
 
     async def test_confirmation_measurement_creates_one_runtime_finding_and_persists_ramp_break(self) -> None:
         audit_id = "audit_ramp_100"
@@ -204,3 +205,4 @@ class RampReportIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persisted.report.ramp_assessment.metric, "error_rate_percent")
         self.assertEqual(persisted.report.ramp_assessment.observed_value, 5.0)
         self.assertEqual(persisted.report.ramp_assessment.threshold, 1.0)
+        self.assertEqual(persisted.report.evidence_inventory.runtime_measurements, [confirmation])

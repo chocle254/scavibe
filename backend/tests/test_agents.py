@@ -158,6 +158,16 @@ class CapturingSecurityGateway(FakeGateway):
 
 
 class AgentTests(unittest.IsolatedAsyncioTestCase):
+    async def test_specialist_report_retains_the_complete_supplied_evidence_inventory(self) -> None:
+        supplied = context()
+        report = await SpecialistAgent(Stage.LEGAL, FakeGateway()).analyze(supplied)
+
+        self.assertIsNotNone(report.evidence_inventory)
+        self.assertEqual(report.evidence_inventory.source_files, supplied.source_files)
+        self.assertEqual(report.evidence_inventory.repository_paths, supplied.repository_paths)
+        self.assertEqual(report.evidence_inventory.runtime_measurements, supplied.runtime_measurements)
+        self.assertEqual(report.evidence_inventory.jurisdictions, supplied.jurisdictions)
+
     async def test_security_score_is_deterministic(self) -> None:
         self.assertIn('"stage", "summary", "findings", and "limitations"', SECURITY_PROMPT)
         self.assertIn('"findings" is an\narray and must be []', SECURITY_PROMPT)

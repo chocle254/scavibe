@@ -134,3 +134,4 @@ class PerformanceRampEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(performance.report)
         self.assertEqual(performance.report.findings, [])
         self.assertIn("did not meet the qualifying gate", performance.report.limitations[0])
+        self.assertEqual(performance.report.evidence_inventory.runtime_measurements, [measurement])

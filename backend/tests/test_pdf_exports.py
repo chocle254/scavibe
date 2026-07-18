@@ -17,7 +17,7 @@ from main import (
     download_security_pdf,
     _stage_pdf_bytes,
 )
-from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceKind, Finding, Impact, RampAssessment, Severity, Stage
+from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceInventory, EvidenceKind, Finding, Impact, RampAssessment, RuntimeMeasurement, Severity, SourceFile, Stage
 from scavibe.pdf_reports import build_stage_pdf, generate_pdf_report
 import scavibe.pdf_reports as pdf_reports
 
@@ -132,6 +132,44 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(document.startswith(b"%PDF-"))
         self.assertTrue(document.rstrip().endswith(b"%%EOF"))
         self.assertGreater(len(document), 3_000)
+
+    async def test_zero_finding_pdf_reproduces_full_evidence_inventory_and_remediation_decision(self) -> None:
+        inventory = EvidenceInventory(
+            source_files=[SourceFile(path="src/consent.ts", content="const collectEmail = true;\nreturn collectEmail;")],
+            repository_paths=["README.md", "src/consent.ts"],
+            source_content_complete=False,
+            runtime_measurements=[
+                RuntimeMeasurement(
+                    id="ramp_100",
+                    target_mode="sandbox",
+                    endpoint="/",
+                    concurrent_users=100,
+                    duration_seconds=60,
+                    sample_count=20,
+                    successful_sample_count=20,
+                    p95_latency_ms=210.0,
+                    error_rate_percent=0.0,
+                )
+            ],
+            jurisdictions=["KE"],
+        )
+        report = report_for(Stage.LEGAL, findings=[]).model_copy(update={"evidence_inventory": inventory})
+
+        with (
+            patch("scavibe.pdf_reports._verbatim_evidence_block", wraps=pdf_reports._verbatim_evidence_block) as block,
+            patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph,
+        ):
+            document = build_stage_pdf(report)
+
+        blocks = [call.args[0] for call in block.call_args_list]
+        rendered_text = [call.args[0] for call in paragraph.call_args_list]
+        self.assertTrue(document.startswith(b"%PDF-"))
+        self.assertIn("README.md\nsrc/consent.ts", blocks)
+        self.assertIn("000001 | const collectEmail = true;\n000002 | return collectEmail;", blocks)
+        self.assertIn("Remediation plan", rendered_text)
+        self.assertIn("No remediation is proposed because no finding met the evidence admission rule. Do not apply a speculative fix from this report.", rendered_text)
+        self.assertIn("Measurement ID: ramp_100", rendered_text)
+        self.assertIn("KE", rendered_text)
 
     async def test_stage_endpoints_return_structural_pdfs_with_exact_filenames(self) -> None:
         performance = await download_performance_pdf(StagePdfRequest(report=report_for(Stage.PERFORMANCE)))

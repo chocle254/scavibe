@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import ValidationError
 
-from ..contracts import AgentDraft, AgentReport, AuditContext, Evidence, EvidenceKind, Finding, ProposedFinding, Stage
+from ..contracts import AgentDraft, AgentReport, AuditContext, Evidence, EvidenceInventory, EvidenceKind, Finding, ProposedFinding, Stage
 from ..scoring import confidence_score, risk_score, severity_for
 from .gateway import AgentProtocolError, Gateway
 
@@ -186,7 +186,14 @@ def validate_draft(
     limitations = list(draft.limitations)
     if required_limitation and required_limitation not in limitations:
         limitations.append(required_limitation)
-    return AgentReport(stage=stage, summary=draft.summary, findings=findings, limitations=limitations, evidence_commit_sha=context.commit_sha)
+    return AgentReport(
+        stage=stage,
+        summary=draft.summary,
+        findings=findings,
+        limitations=limitations,
+        evidence_commit_sha=context.commit_sha,
+        evidence_inventory=EvidenceInventory.from_context(context),
+    )
 
 
 class SpecialistAgent:

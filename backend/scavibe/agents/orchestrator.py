@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..contracts import AgentReport, AuditContext, AuditRun, Stage, StageResult
+from ..contracts import AgentReport, AuditContext, AuditRun, EvidenceInventory, Stage, StageResult
 from .base import SpecialistAgent
 from .gateway import AgentProtocolError, Gateway
 from .legal_agent import LEGAL_DISCLAIMER, LEGAL_PROMPT, validate_legal_finding
@@ -42,6 +42,7 @@ class AuditOrchestrator:
                         findings=[],
                         limitations=[prerequisite],
                         evidence_commit_sha=context.commit_sha,
+                        evidence_inventory=EvidenceInventory.from_context(context),
                     )
                 results.append(StageResult(stage=stage, status="blocked", report=report, reason=prerequisite))
                 continue
