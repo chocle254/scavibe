@@ -105,7 +105,7 @@ class AuditContext(BaseModel):
 
     audit_id: Annotated[str, Field(pattern=r"^[a-zA-Z0-9_-]{4,64}$")]
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     commit_sha: Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
     source_files: Annotated[list[SourceFile], Field(min_length=1, max_length=2_000)]
     repository_paths: Annotated[list[str], Field(min_length=1, max_length=10_000)]

@@ -19,7 +19,7 @@ class AuditPinError(RuntimeError):
 class AuditPin:
     audit_id: str
     repository_url: str
-    app_url: str
+    app_url: str | None
     commit_sha: str
 
 
@@ -51,7 +51,7 @@ def _secret_from_environment() -> bytes:
     return value.encode("utf-8")
 
 
-def issue_audit_pin(*, audit_id: str, repository_url: str, app_url: str, commit_sha: str) -> str:
+def issue_audit_pin(*, audit_id: str, repository_url: str, app_url: str | None, commit_sha: str) -> str:
     payload = json.dumps(
         {"audit_id": audit_id, "repository_url": repository_url, "app_url": app_url, "commit_sha": commit_sha},
         separators=(",", ":"),
@@ -73,10 +73,13 @@ def read_audit_pin(value: str) -> AuditPin:
         raise AuditPinError("audit_pin signature is invalid")
     try:
         parsed = json.loads(payload)
+        app_url = parsed["app_url"]
+        if app_url is not None and not isinstance(app_url, str):
+            raise TypeError("audit_pin app_url must be a string or null")
         return AuditPin(
             audit_id=parsed["audit_id"],
             repository_url=parsed["repository_url"],
-            app_url=parsed["app_url"],
+            app_url=app_url,
             commit_sha=parsed["commit_sha"],
         )
     except (KeyError, TypeError, json.JSONDecodeError) as error:

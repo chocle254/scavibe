@@ -104,7 +104,7 @@ async def fetch_repository_identity(repository_url: str) -> RepositoryIdentity:
 
 
 async def fetch_public_repository(
-    *, audit_id: str, repository_url: str, app_url: str, jurisdictions: list[str], runtime_measurements: list,
+    *, audit_id: str, repository_url: str, app_url: str | None, jurisdictions: list[str], runtime_measurements: list,
     commit_sha_override: str | None = None,
 ) -> RepositorySnapshot:
     """Fetch at most 2 MiB of text source and the complete Git tree manifest.

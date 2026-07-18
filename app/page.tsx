@@ -263,12 +263,8 @@ export default function Home() {
 
   function begin(event: FormEvent) {
     event.preventDefault();
-    if (!repository.trim() || !appUrl.trim() || (!sandboxUrl.trim() && !useScavibeSandbox)) {
-      setError("Enter a public GitHub repository, deployed app URL, and either a sandbox URL or the disposable Scavibe sandbox.");
-      return;
-    }
-    if (!authorized) {
-      setError("Confirm explicit authorization before Scavibe sends sandbox traffic.");
+    if (!repository.trim()) {
+      setError("Enter a public GitHub repository URL to begin an audit session.");
       return;
     }
     resetAudit();
@@ -278,7 +274,7 @@ export default function Home() {
   function requestBody(targetSandbox?: string) {
     return {
       repository_url: repository.trim(),
-      app_url: appUrl.trim(),
+      app_url: appUrl.trim() || undefined,
       sandbox_url: targetSandbox || sandboxUrl.trim() || undefined,
       sandbox_authorized: authorized,
       jurisdictions,
@@ -419,6 +415,14 @@ export default function Home() {
 
   async function runStage() {
     if (!stage || busy) return;
+    if (stage === "performance" && !authorized) {
+      setError("Confirm explicit authorization before Scavibe sends sandbox traffic.");
+      return;
+    }
+    if (stage === "performance" && !useScavibeSandbox && !sandboxUrl.trim()) {
+      setError("Enter an authorized HTTPS sandbox URL or use the disposable Scavibe sandbox before starting the performance stage.");
+      return;
+    }
     setOperation("auditing");
     setError("");
     setPrUrl("");
@@ -493,7 +497,7 @@ export default function Home() {
     try {
       const result = await post<{ url: string }>("/audit-stages/source-fix-pull-request", {
         repository_url: repository.trim(),
-        app_url: appUrl.trim(),
+        app_url: appUrl.trim() || undefined,
         audit_id: activeResult.audit_id,
         audit_pin: activeResult.audit_pin,
         report: activeResult.report,
@@ -598,14 +602,14 @@ export default function Home() {
         <form className="intake-card" onSubmit={begin}>
           <div className="card-top"><b>Open an audit session</b><small>3 evidence stages</small></div>
           <label>Public GitHub repository<input type="url" value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="https://github.com/owner/repository" required /></label>
-          <label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app" required /></label>
+          <label>Deployed app URL<input type="url" value={appUrl} onChange={(event) => setAppUrl(event.target.value)} placeholder="https://your-app.vercel.app (optional — leave blank if not deployed yet)" /></label>
           <label className="sandbox-toggle"><input type="checkbox" checked={useScavibeSandbox} onChange={(event) => setUseScavibeSandbox(event.target.checked)} /><span><b>Use a disposable Scavibe Vercel sandbox</b>It receives no production environment variables and is deleted after the performance ramp.</span></label>
           <label>Authorized sandbox URL {useScavibeSandbox ? <small>(manual alternative)</small> : null}<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required={!useScavibeSandbox} /></label>
           {suggesting ? <p className="subtle">Reading deployment suggestions…</p> : null}
           {suggestions.length > 0 ? <div className="suggestions"><span>Commit-aware deployment suggestions</span>{suggestions.map((item) => <button key={item.url} type="button" onClick={() => setSandboxUrl(item.url)}><Icon name="check" /><b>{item.provider}</b><code>{item.url}</code><small>{item.environment} · {item.commit_sha.slice(0, 8)}</small></button>)}</div> : null}
           <label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own this sandbox or have explicit authorization to test it. The performance stage sends bounded GET requests only to the sandbox.</span></label>
           {error ? <p className="form-error">{error}</p> : null}
-          <button className="primary full" type="submit" disabled={!authorized}>Enter performance lab <Icon name="arrow" /></button>
+          <button className="primary full" type="submit">Open audit workspace <Icon name="arrow" /></button>
         </form>
       </section>
     </main>;
@@ -618,11 +622,10 @@ export default function Home() {
     <div className="audit-layout">
       <aside className="pipeline">
         <div className="pipeline-title">Audit sequence<span>{activeMeta?.label}</span></div>
-        {stages.map((item, index) => {
+        {stages.map((item) => {
           const complete = Boolean(results[item.id]);
           const active = item.id === stage;
-          const locked = index > 0 && !results[stages[index - 1].id];
-          return <button key={item.id} className={["pipeline-step", active ? "active" : "", complete ? "complete" : ""].join(" ")} disabled={locked} onClick={() => setStage(item.id)}><b>{complete ? <Icon name="check" /> : item.no}</b><span>{item.name}<small>{complete ? "Report sealed" : active ? "Current stage" : locked ? "Awaiting prior stage" : "Ready"}</small></span></button>;
+          return <button key={item.id} className={["pipeline-step", active ? "active" : "", complete ? "complete" : ""].join(" ")} onClick={() => setStage(item.id)}><b>{complete ? <Icon name="check" /> : item.no}</b><span>{item.name}<small>{complete ? "Report sealed" : active ? "Current stage" : "Ready"}</small></span></button>;
         })}
         <p className="pipeline-note"><Icon name="lock" /> Scavibe shows evidence coverage. It does not claim repository-wide absence when source selection is capped.</p>
       </aside>

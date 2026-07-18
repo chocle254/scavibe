@@ -113,7 +113,7 @@ async def remove_vercel_api_prefix(request, call_next):
 
 class AuditRequest(BaseModel):
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     live_target_confirmed: bool = False
 
 
@@ -121,14 +121,14 @@ class AuditJob(BaseModel):
     id: str
     status: str
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     target_mode: str
     created_at: datetime
 
 
 class StageAuditRequest(BaseModel):
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     sandbox_url: HttpUrl | None = None
     sandbox_authorized: bool = False
     concurrent_users: int = 100
@@ -190,7 +190,7 @@ class PullRequestResponse(BaseModel):
 
 class SourceFixPullRequestRequest(BaseModel):
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     audit_id: str
     audit_pin: str
     report: AgentReport
@@ -223,7 +223,7 @@ class VercelSandboxResponse(BaseModel):
 
 class VercelSandboxLoadTestRequest(BaseModel):
     repository_url: HttpUrl
-    app_url: HttpUrl
+    app_url: HttpUrl | None = None
     ticket: str
     concurrent_users: int = 100
     duration_seconds: int = 60
@@ -233,6 +233,11 @@ class VercelSandboxLoadTestRequest(BaseModel):
 
 
 JOBS: dict[str, AuditJob] = {}
+
+
+def _optional_url(value: HttpUrl | None) -> str | None:
+    """Preserve absent deployed-app metadata as null, never the string 'None'."""
+    return str(value) if value is not None else None
 
 
 @app.get("/health")
@@ -428,8 +433,10 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
         raise HTTPException(status_code=404, detail="Audit not found")
     if context.audit_id != audit_id:
         raise HTTPException(status_code=422, detail="context.audit_id must equal the URL audit_id")
-    if str(context.repository_url) != str(job.repository_url) or str(context.app_url) != str(job.app_url):
-        raise HTTPException(status_code=422, detail="context URLs must equal the URLs used to create the audit")
+    if str(context.repository_url) != str(job.repository_url):
+        raise HTTPException(status_code=422, detail="context.repository_url must equal the repository_url used to create the audit")
+    if _optional_url(context.app_url) != _optional_url(job.app_url):
+        raise HTTPException(status_code=422, detail="context.app_url must equal the app_url used to create the audit")
     try:
         settings = NvidiaNimSettings.from_environment()
     except RuntimeError as error:
@@ -451,7 +458,7 @@ async def _repository_snapshot(
         return await fetch_public_repository(
             audit_id=audit_id,
             repository_url=str(request.repository_url),
-            app_url=str(request.app_url),
+            app_url=_optional_url(request.app_url),
             jurisdictions=request.jurisdictions,
             runtime_measurements=measurements,
             commit_sha_override=commit_sha_override,
@@ -483,8 +490,10 @@ async def _pinned_repository_snapshot(
             raise HTTPException(status_code=422, detail=str(error)) from error
         if pin.audit_id != audit_id:
             raise HTTPException(status_code=422, detail="audit_pin does not match audit_id")
-        if pin.repository_url != str(request.repository_url) or pin.app_url != str(request.app_url):
-            raise HTTPException(status_code=422, detail="audit_pin does not match repository_url and app_url")
+        if pin.repository_url != str(request.repository_url):
+            raise HTTPException(status_code=422, detail="audit_pin does not match repository_url")
+        if pin.app_url != _optional_url(request.app_url):
+            raise HTTPException(status_code=422, detail="audit_pin app_url does not match incoming app_url")
         snapshot = await _repository_snapshot(
             request,
             measurements,
@@ -502,7 +511,7 @@ async def _pinned_repository_snapshot(
         audit_pin = issue_audit_pin(
             audit_id=audit_id,
             repository_url=str(request.repository_url),
-            app_url=str(request.app_url),
+            app_url=_optional_url(request.app_url),
             commit_sha=snapshot.context.commit_sha,
         )
     except AuditPinError as error:
