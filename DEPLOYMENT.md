@@ -27,7 +27,7 @@ Add these server-side variables to the Vercel project:
 
 | Variable | Required value |
 | --- | --- |
-| `SCAVIBE_LLM_PROVIDER` | Exactly `openai` (default) or `nvidia`. This explicit selection controls every specialist stage. |
+| `SCAVIBE_LLM_PROVIDER` | Exactly `openai` (default), `nvidia`, or `auto`. `auto` tries OpenAI first on every specialist request and retries once with NVIDIA after an OpenAI gateway failure. |
 | `OPENAI_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=openai`; server-side key with access to `gpt-5.6-terra`. |
 | `NVIDIA_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=nvidia`; server-side NVIDIA NIM key. NVIDIA output is labeled as NVIDIA NIM, not GPT-5.6. |
 | `SCAVIBE_NVIDIA_MODEL` | Optional only when `SCAVIBE_LLM_PROVIDER=nvidia`; default `nvidia/llama-3.3-nemotron-super-49b-v1.5`. |

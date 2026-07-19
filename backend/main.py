@@ -23,6 +23,7 @@ import httpx
 
 from scavibe.agents import (
     AgentProtocolError,
+    AutoFallbackGateway,
     AuditOrchestrator,
     Gateway,
     NvidiaNimGateway,
@@ -448,7 +449,12 @@ def _configured_gateway() -> Gateway:
     provider = selected_llm_provider()
     if provider == "openai":
         return OpenAIGateway(OpenAISettings.from_environment())
-    return NvidiaNimGateway(NvidiaNimSettings.from_environment())
+    if provider == "nvidia":
+        return NvidiaNimGateway(NvidiaNimSettings.from_environment())
+    return AutoFallbackGateway(
+        OpenAIGateway(OpenAISettings.from_environment()),
+        NvidiaNimGateway(NvidiaNimSettings.from_environment()),
+    )
 
 
 @app.post("/audits/{audit_id}/run", response_model=AuditRun)

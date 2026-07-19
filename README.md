@@ -137,6 +137,13 @@ NVIDIA NIM's Chat Completions API instead. It is a fallback for a credit-limited
 deployment, not GPT-5.6 output. Every specialist report and PDF identifies the
 exact analysis engine that produced it.
 
+`SCAVIBE_LLM_PROVIDER=auto` tries OpenAI first for every specialist request and
+retries once with NVIDIA only after an OpenAI gateway failure (HTTP failure,
+timeout, invalid API response, or empty API response). It requires both keys.
+The next request returns to GPT-5.6 automatically as soon as OpenAI succeeds.
+Agent-draft validation, evidence rejection, and proof-of-concept safety
+rejection do not trigger fallback because they are not API availability errors.
+
 The performance ramp does not use either LLM. It is a deterministic, bounded
 HTTP GET measurement against the authorized disposable sandbox; the report
 identifies it as such.
@@ -175,13 +182,15 @@ Scavibe does not draft policy text, terms, or other legal documents. Its data-ha
 
 **Backend (`.env`)**
 ```
-# Select exactly one provider: openai or nvidia.
+# Select exactly one provider: openai, nvidia, or auto.
 SCAVIBE_LLM_PROVIDER=openai
 OPENAI_API_KEY=your_openai_project_key
 # NVIDIA fallback example:
 # SCAVIBE_LLM_PROVIDER=nvidia
 # NVIDIA_API_KEY=your_nvidia_nim_key
 # SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5
+# Automatic recovery, requiring both keys:
+# SCAVIBE_LLM_PROVIDER=auto
 GITHUB_TOKEN=ghp_...
 BLOB_READ_WRITE_TOKEN=...
 ```

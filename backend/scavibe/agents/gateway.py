@@ -69,11 +69,11 @@ class NvidiaNimSettings:
         return cls(api_key=api_key, model=model)
 
 
-def selected_llm_provider() -> Literal["openai", "nvidia"]:
-    """Read the deliberate server-side provider choice; never silently fail over."""
+def selected_llm_provider() -> Literal["openai", "nvidia", "auto"]:
+    """Read the explicit server-side provider selection, including logged auto fallback."""
     provider = os.environ.get("SCAVIBE_LLM_PROVIDER", "openai").strip().lower()
-    if provider not in {"openai", "nvidia"}:
-        raise RuntimeError("SCAVIBE_LLM_PROVIDER must be exactly openai or nvidia")
+    if provider not in {"openai", "nvidia", "auto"}:
+        raise RuntimeError("SCAVIBE_LLM_PROVIDER must be exactly openai, nvidia, or auto")
     return provider  # type: ignore[return-value]
 
 
@@ -180,6 +180,43 @@ class NvidiaNimGateway:
     @property
     def audit_engine_label(self) -> str:
         return f"NVIDIA NIM ({self._settings.model})"
+
+
+class AutoFallbackGateway:
+    """OpenAI-first provider with one explicit NVIDIA retry for gateway failures."""
+
+    def __init__(self, primary: OpenAIGateway, fallback: NvidiaNimGateway) -> None:
+        self._primary = primary
+        self._fallback = fallback
+        self._successful_engines: list[str] = []
+
+    async def generate(self, *, system_prompt: str, input_json: str) -> str:
+        try:
+            content = await self._primary.generate(system_prompt=system_prompt, input_json=input_json)
+        except AgentProtocolError as primary_error:
+            LOGGER.warning(
+                "openai_gateway_failed_using_nvidia_fallback error_type=%s",
+                type(primary_error).__name__,
+            )
+            content = await self._fallback.generate(system_prompt=system_prompt, input_json=input_json)
+            self._record_engine(self._fallback.audit_engine_label)
+            return content
+        self._record_engine(self._primary.audit_engine_label)
+        return content
+
+    async def aclose(self) -> None:
+        await self._primary.aclose()
+        await self._fallback.aclose()
+
+    @property
+    def audit_engine_label(self) -> str:
+        if not self._successful_engines:
+            return "OpenAI preferred with NVIDIA NIM fallback (no successful model response)"
+        return "; ".join(self._successful_engines)
+
+    def _record_engine(self, engine: str) -> None:
+        if engine not in self._successful_engines:
+            self._successful_engines.append(engine)
 
 
 def _response_output_text(payload: object) -> str | None:

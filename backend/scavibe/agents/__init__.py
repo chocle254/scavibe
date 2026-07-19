@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..contracts import Stage
 from .base import SpecialistAgent, identity_context
-from .gateway import AgentProtocolError, Gateway, NvidiaNimGateway, NvidiaNimSettings, OpenAIGateway, OpenAISettings, selected_llm_provider
+from .gateway import AutoFallbackGateway, AgentProtocolError, Gateway, NvidiaNimGateway, NvidiaNimSettings, OpenAIGateway, OpenAISettings, selected_llm_provider
 from .legal_agent import LEGAL_DISCLAIMER, LEGAL_PROMPT, validate_legal_finding
 from .orchestrator import AuditOrchestrator
 from .performance_agent import PERFORMANCE_PROMPT, validate_performance_finding
@@ -22,6 +22,7 @@ def stage_configuration_for(stage: Stage):
 
 __all__ = [
     "AgentProtocolError",
+    "AutoFallbackGateway",
     "AuditOrchestrator",
     "Gateway",
     "NvidiaNimGateway",

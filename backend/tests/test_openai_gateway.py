@@ -10,6 +10,7 @@ from unittest.mock import patch
 import httpx
 
 from scavibe.agents.gateway import (
+    AutoFallbackGateway,
     DEFAULT_NVIDIA_NIM_MODEL,
     MAX_NVIDIA_NIM_OUTPUT_TOKENS,
     NVIDIA_NIM_CHAT_COMPLETIONS_URL,
@@ -118,11 +119,49 @@ class OpenAIGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(payload["stream"])
         self.assertEqual(gateway.audit_engine_label, f"NVIDIA NIM ({DEFAULT_NVIDIA_NIM_MODEL})")
 
+    async def test_auto_gateway_retries_nvidia_once_then_returns_to_openai(self) -> None:
+        openai_requests: list[httpx.Request] = []
+        nvidia_requests: list[httpx.Request] = []
+
+        def openai_handler(request: httpx.Request) -> httpx.Response:
+            openai_requests.append(request)
+            if len(openai_requests) == 1:
+                return httpx.Response(status_code=503, json={"error": {"message": "service unavailable"}})
+            return httpx.Response(status_code=200, json={"output_text": "openai-success"})
+
+        def nvidia_handler(request: httpx.Request) -> httpx.Response:
+            nvidia_requests.append(request)
+            return httpx.Response(status_code=200, json={"choices": [{"message": {"content": "nvidia-fallback-success"}}]})
+
+        gateway = AutoFallbackGateway(
+            OpenAIGateway(OpenAISettings(api_key="test-openai-key"), transport=httpx.MockTransport(openai_handler)),
+            NvidiaNimGateway(
+                NvidiaNimSettings(api_key="test-nvidia-key", model=DEFAULT_NVIDIA_NIM_MODEL),
+                transport=httpx.MockTransport(nvidia_handler),
+            ),
+        )
+        try:
+            first = await gateway.generate(system_prompt="Return JSON.", input_json='{"stage":"security"}')
+            second = await gateway.generate(system_prompt="Return JSON.", input_json='{"stage":"legal"}')
+        finally:
+            await gateway.aclose()
+
+        self.assertEqual(first, "nvidia-fallback-success")
+        self.assertEqual(second, "openai-success")
+        self.assertEqual(len(openai_requests), 2)
+        self.assertEqual(len(nvidia_requests), 1)
+        self.assertIn("NVIDIA NIM", gateway.audit_engine_label)
+        self.assertIn("OpenAI GPT-5.6 Terra", gateway.audit_engine_label)
+
     def test_provider_selection_requires_an_exact_value(self) -> None:
         environment = dict(os.environ)
         environment["SCAVIBE_LLM_PROVIDER"] = "nvidia"
         with patch.dict(os.environ, environment, clear=True):
             self.assertEqual(selected_llm_provider(), "nvidia")
+
+        environment["SCAVIBE_LLM_PROVIDER"] = "auto"
+        with patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(selected_llm_provider(), "auto")
 
         environment["SCAVIBE_LLM_PROVIDER"] = "free"
         with patch.dict(os.environ, environment, clear=True):
