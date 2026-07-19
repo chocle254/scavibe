@@ -2,7 +2,7 @@
 
 **AI-powered pre-launch audit for vibe-coded apps.**
 
-Built using Codex + NVIDIA NIM.
+Built using Codex + GPT-5.6.
 
 ---
 
@@ -102,7 +102,15 @@ app, or open a pull request.
   rate only above 1.0% under those same minimum test conditions.
 - **Security** requires a copied source quote with its exact file and inclusive
   line range for every finding. It rejects findings based only on a filename,
-  TODO, dependency name, comment, or hypothetical endpoint.
+  TODO, dependency name, comment, or hypothetical endpoint. Every static
+  finding is labeled `candidate_unconfirmed` unless a signed Scavibe sandbox
+  returns the exact status and source-cited response marker required by a
+  validated proof plan. The model may propose the plan, but Scavibe executes
+  only its fixed one-GET template: 5.0-second timeout, no redirects, no query
+  string, no request body, no authentication header, and an exact sandbox-host
+  match. The report and PDF retain proposed code, executed code, response
+  status, a response excerpt capped at 4,096 bytes, its SHA-256, and the final
+  confirmation state. Unsafe or incomplete plans remain unconfirmed.
 - **Data-handling and consent** maps observed data handling only to explicitly supplied
   jurisdictions. It does not state that a product is legally compliant or in
   violation of a law, and every report includes the legal disclaimer.
@@ -133,7 +141,7 @@ Scavibe does not draft policy text, terms, or other legal documents. Its data-ha
 |---|---|
 | Frontend | Next.js 14 (App Router) + Tailwind CSS, deployed to Vercel |
 | Backend | FastAPI (Python), async background tasks, deployed to Railway |
-| LLM | NVIDIA NIM `nvidia/llama-3.3-nemotron-super-49b-v1` free trial endpoint — powers all three agent stages |
+| LLM | OpenAI Responses API with GPT-5.6 Terra (`gpt-5.6-terra`) — powers all three agent stages |
 | Load testing | Async HTTPX bounded GET ramp against an authorized sandbox deployment |
 | GitHub integration | GitHub API — reads repos, opens pull requests |
 | Storage | PDFs are generated per request; the backend does not claim persistent report storage |
@@ -147,14 +155,13 @@ Scavibe does not draft policy text, terms, or other legal documents. Its data-ha
 - Node.js 18+
 - Python 3.11+
 - A GitHub personal access token (repo scope)
-- An NVIDIA Build API key with access to the selected NVIDIA NIM endpoint
+- An OpenAI API key with access to GPT-5.6 Terra
 
 ### Environment Variables
 
 **Backend (`.env`)**
 ```
-NVIDIA_API_KEY=nvapi-...
-SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1
+OPENAI_API_KEY=your_openai_project_key
 GITHUB_TOKEN=ghp_...
 BLOB_READ_WRITE_TOKEN=...
 ```
@@ -196,4 +203,4 @@ traffic to a production URL by default.
 
 ## Built With
 
-Codex + NVIDIA NIM, used across all three agent stages for code understanding, security analysis, and document generation.
+Codex + GPT-5.6, used across all three agent stages for code understanding, security analysis, and document generation.

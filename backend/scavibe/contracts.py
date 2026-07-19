@@ -49,6 +49,13 @@ class Severity(str, Enum):
     CRITICAL = "critical"
 
 
+class ExploitabilityStatus(str, Enum):
+    """Dynamic confirmation state for a source-evidenced security finding."""
+
+    CONFIRMED_EXPLOITABLE = "confirmed_exploitable"
+    CANDIDATE_UNCONFIRMED = "candidate_unconfirmed"
+
+
 class Evidence(BaseModel):
     kind: EvidenceKind
     statement: Annotated[str, Field(min_length=12, max_length=500)]
@@ -168,10 +175,28 @@ class AgentDraft(BaseModel):
     limitations: Annotated[list[str], Field(max_length=10)]
 
 
+class SecurityPocExecution(BaseModel):
+    """A non-destructive sandbox probe and its immutable execution record."""
+
+    proposed_test_code: Annotated[str, Field(min_length=1, max_length=2_000)]
+    executed_test_code: Annotated[str | None, Field(default=None, max_length=2_000)]
+    execution_state: Literal["not_executed", "executed"]
+    request_method: Literal["GET"] | None = None
+    request_path: Annotated[str | None, Field(default=None, max_length=256)]
+    expected_status_code: Annotated[int | None, Field(default=None, ge=200, le=299)]
+    expected_response_marker: Annotated[str | None, Field(default=None, min_length=1, max_length=128)]
+    response_status_code: Annotated[int | None, Field(default=None, ge=100, le=599)]
+    response_excerpt: Annotated[str | None, Field(default=None, max_length=4_096)]
+    response_sha256: Annotated[str | None, Field(default=None, pattern=r"^[0-9a-f]{64}$")]
+    reason: Annotated[str, Field(min_length=20, max_length=800)]
+
+
 class Finding(ProposedFinding):
     risk_score: Annotated[int, Field(ge=0, le=100)]
     severity: Severity
     confidence_score: Annotated[int, Field(ge=0, le=100)]
+    exploitability_status: ExploitabilityStatus | None = None
+    poc_execution: SecurityPocExecution | None = None
 
 
 class RampAssessment(BaseModel):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .contracts import AgentReport, Evidence, EvidenceKind, Stage
+from .contracts import AgentReport, Evidence, EvidenceKind, ExploitabilityStatus, Finding, Stage
 
 
 STAGE_AUDIT_LABELS = {
@@ -12,6 +12,25 @@ STAGE_AUDIT_LABELS = {
     Stage.SECURITY: "Security audit",
     Stage.LEGAL: "Data-handling and consent audit",
 }
+
+EXPLOITABILITY_LABELS = {
+    ExploitabilityStatus.CONFIRMED_EXPLOITABLE: "Confirmed exploitable",
+    ExploitabilityStatus.CANDIDATE_UNCONFIRMED: "Candidate — unconfirmed",
+}
+
+
+def ordered_findings(findings: list[Finding]) -> list[Finding]:
+    """Keep confirmed sandbox results ahead of static candidates in every export."""
+    return sorted(
+        findings,
+        key=lambda finding: 0 if finding.exploitability_status == ExploitabilityStatus.CONFIRMED_EXPLOITABLE else 1,
+    )
+
+
+def exploitability_label(finding: Finding) -> str | None:
+    if finding.exploitability_status is None:
+        return None
+    return EXPLOITABILITY_LABELS[finding.exploitability_status]
 
 
 def format_evidence_markdown(evidence: Evidence) -> str:
@@ -82,7 +101,7 @@ def report_markdown(report: AgentReport) -> str:
     lines = [f"# Scavibe {STAGE_AUDIT_LABELS[report.stage]}", "", report.summary, "", "## Findings", ""]
     if not report.findings:
         lines.extend(["No evidence-backed findings were returned for the supplied evidence set.", ""])
-    for finding in report.findings:
+    for finding in ordered_findings(report.findings):
         lines.extend(
             [
                 f"### {finding.severity.value.upper()} · {finding.title}",
@@ -99,10 +118,43 @@ def report_markdown(report: AgentReport) -> str:
             ]
         )
         lines.extend(format_evidence_markdown(evidence) for evidence in finding.evidence)
+        label = exploitability_label(finding)
+        if label is not None:
+            lines.extend(["", "**Exploitability status**", "", label])
+        if finding.poc_execution is not None:
+            execution = finding.poc_execution
+            proposed_fence = _code_fence(execution.proposed_test_code)
+            lines.extend(
+                [
+                    "",
+                    "**Sandbox proof-of-concept audit trail**",
+                    "",
+                    "Model-proposed test code:",
+                    "",
+                    proposed_fence,
+                    execution.proposed_test_code,
+                    proposed_fence,
+                    "",
+                    f"Execution state: `{execution.execution_state}`",
+                    f"Result: {execution.reason}",
+                ]
+            )
+            if execution.executed_test_code is not None:
+                executed_fence = _code_fence(execution.executed_test_code)
+                lines.extend(["", "Executed fixed-template test code:", "", executed_fence, execution.executed_test_code, executed_fence])
+            if execution.request_path is not None:
+                lines.append(f"Validated request: `{execution.request_method} {execution.request_path}`")
+            if execution.response_status_code is not None:
+                lines.append(f"Observed HTTP status: `{execution.response_status_code}`")
+            if execution.response_sha256 is not None:
+                lines.append(f"Response excerpt SHA-256: `{execution.response_sha256}`")
+            if execution.response_excerpt is not None:
+                response_fence = _code_fence(execution.response_excerpt)
+                lines.extend(["", "Captured response excerpt:", "", response_fence, execution.response_excerpt, response_fence])
         lines.append("")
     lines.extend(["## Remediation plan", ""])
     if report.findings:
-        lines.extend(f"- **{finding.title}**: {finding.remediation}" for finding in report.findings)
+        lines.extend(f"- **{finding.title}**: {finding.remediation}" for finding in ordered_findings(report.findings))
     else:
         lines.append("No remediation is proposed because no finding met the evidence admission rule. Do not apply a speculative fix from this report.")
     lines.extend(["## Limitations", ""])

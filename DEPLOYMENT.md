@@ -19,7 +19,7 @@ frontend remains the fallback if Vercel Services is unavailable.
 5. Deploy a Preview environment and record its exact `https://...vercel.app` URL.
 
 The root `vercel.json` routes `/api/*` to FastAPI and all other paths to
-Next.js. Do not expose `NVIDIA_API_KEY` to client-side Vercel variables.
+Next.js. Do not expose `OPENAI_API_KEY` to client-side Vercel variables.
 
 ## 2. Configure Vercel variables
 
@@ -27,8 +27,7 @@ Add these server-side variables to the Vercel project:
 
 | Variable | Required value |
 | --- | --- |
-| `NVIDIA_API_KEY` | Server-side NVIDIA Build API key. |
-| `SCAVIBE_NVIDIA_MODEL` | `nvidia/llama-3.3-nemotron-super-49b-v1`. |
+| `OPENAI_API_KEY` | Server-side OpenAI API key with access to `gpt-5.6-terra`. |
 | `SCAVIBE_ALLOWED_ORIGINS` | The exact Vercel preview origin, such as `https://scavibe-git-main-team.vercel.app`. |
 | `GITHUB_TOKEN` | Required for private-repository intake and for user-approved draft PR creation. Public repository intake works without it, subject to GitHub's unauthenticated API limit. |
 | `BLOB_READ_WRITE_TOKEN` | Not required for the current agent backbone. |
@@ -65,6 +64,14 @@ application that requires secrets to boot will fail its Vercel build or runtime;
 Scavibe reports that failure and sends no load traffic. Never copy production
 secrets into the disposable sandbox configuration.
 
+The same signed sandbox ticket is required for dynamic security confirmation.
+Scavibe never accepts a client-provided URL for these probes. It sends at most
+one validated `GET` request per static candidate, with a 5.0-second timeout,
+no redirect follow, no query string, no request body, and an exact match to the
+signed HTTPS sandbox host. Each probe result retains at most 4,096 response
+bytes plus a SHA-256 in the security report; the disposable project is deleted
+after the audit.
+
 `SCAVIBE_ALLOWED_ORIGINS` accepts comma-separated exact origins and cannot be
 `*`. Add the production Vercel origin before promoting to production.
 
@@ -87,7 +94,7 @@ curl -i -X POST https://YOUR-VERCEL-DOMAIN/api/audits \
 
 Expected result: HTTP `201`, `"status":"queued"`, and
 `"target_mode":"sandbox-required"`. This request does not clone a repository,
-send load traffic, call NVIDIA, or change GitHub.
+send load traffic, call OpenAI, or change GitHub.
 
 ## 5. Railway fallback
 
@@ -111,7 +118,7 @@ code. It contains only a public route, never an API key.
 
 The API fetches public GitHub repositories at a pinned commit, runs bounded GET
 load tests against user-authorized HTTPS sandbox URLs, and calls specialist
-agents after `NVIDIA_API_KEY` is configured. When the sandbox variables are
+agents after `OPENAI_API_KEY` is configured. When the sandbox variables are
 configured, a trusted user can also create a no-secret Vercel project from the
 pinned commit, test it only after Vercel reports `READY`, and trigger project
 deletion after the test. The browser polls readiness for exactly 180 seconds.

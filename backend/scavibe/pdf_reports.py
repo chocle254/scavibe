@@ -27,7 +27,7 @@ from reportlab.platypus import (
 )
 
 from .contracts import AgentReport, Finding, Stage
-from .reporting import STAGE_AUDIT_LABELS, format_evidence_markdown
+from .reporting import STAGE_AUDIT_LABELS, exploitability_label, format_evidence_markdown, ordered_findings
 
 
 class PdfGenerationError(RuntimeError):
@@ -215,7 +215,36 @@ def _finding_flowables(finding: Finding, styles: dict[str, ParagraphStyle], cont
         _paragraph("Evidence", styles["eyebrow"]),
         *evidence_lines,
     ]
-    return [_panel(card_content, content_width), Spacer(1, 9)]
+    label = exploitability_label(finding)
+    if label is not None:
+        card_content.extend([_paragraph("Exploitability status", styles["eyebrow"]), _paragraph(label, styles["body"])])
+    poc_code_flowables: list[object] = []
+    if finding.poc_execution is not None:
+        execution = finding.poc_execution
+        card_content.extend(
+            [
+                _paragraph("Sandbox proof-of-concept audit trail", styles["eyebrow"]),
+                _paragraph(f"Execution state: {execution.execution_state}", styles["muted"]),
+                _paragraph(execution.reason, styles["body"]),
+            ]
+        )
+        poc_code_flowables.extend(
+            [
+                _paragraph("Model-proposed test code", styles["eyebrow"]),
+                _verbatim_evidence_block(execution.proposed_test_code, styles),
+            ]
+        )
+        if execution.executed_test_code is not None:
+            poc_code_flowables.extend([_paragraph("Executed fixed-template test code", styles["eyebrow"]), _verbatim_evidence_block(execution.executed_test_code, styles)])
+        if execution.request_path is not None:
+            card_content.append(_paragraph(f"Validated request: {execution.request_method} {execution.request_path}", styles["muted"]))
+        if execution.response_status_code is not None:
+            card_content.append(_paragraph(f"Observed HTTP status: {execution.response_status_code}", styles["muted"]))
+        if execution.response_sha256 is not None:
+            card_content.append(_paragraph(f"Response excerpt SHA-256: {execution.response_sha256}", styles["muted"]))
+        if execution.response_excerpt is not None:
+            poc_code_flowables.extend([_paragraph("Captured response excerpt", styles["eyebrow"]), _verbatim_evidence_block(execution.response_excerpt, styles)])
+    return [_panel(card_content, content_width), *poc_code_flowables, Spacer(1, 9)]
 
 
 def _verbatim_evidence_block(text: str, styles: dict[str, ParagraphStyle]) -> Preformatted:
@@ -353,7 +382,7 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
             )
         story.extend([_paragraph("Load ramp confirmation", styles["section"]), _panel([_paragraph(ramp_text, styles["body"])], content_width)])
     if report.findings:
-        for finding in report.findings:
+        for finding in ordered_findings(report.findings):
             story.extend(_finding_flowables(finding, styles, content_width))
     else:
         story.extend(
@@ -371,7 +400,7 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
     story.append(_paragraph("Remediation plan", styles["section"]))
     if report.findings:
         remediation_lines: list[object] = []
-        for finding in report.findings:
+        for finding in ordered_findings(report.findings):
             remediation_lines.extend(
                 [
                     _paragraph(finding.title, styles["finding"]),

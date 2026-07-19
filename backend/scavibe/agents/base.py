@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import ValidationError
 
-from ..contracts import AgentDraft, AgentReport, AuditContext, Evidence, EvidenceInventory, EvidenceKind, Finding, ProposedFinding, Stage
+from ..contracts import AgentDraft, AgentReport, AuditContext, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, ProposedFinding, Stage
 from ..scoring import confidence_score, risk_score, severity_for
 from .gateway import AgentProtocolError, Gateway
 
@@ -175,9 +175,12 @@ def validate_draft(
         for item in proposed.evidence:
             _validate_evidence(item, context)
         stage_validator(proposed, context)
+        values = proposed.model_dump()
+        if stage == Stage.SECURITY:
+            values["exploitability_status"] = ExploitabilityStatus.CANDIDATE_UNCONFIRMED
         findings.append(
             Finding(
-                **proposed.model_dump(),
+                **values,
                 risk_score=risk_score(proposed.impact, proposed.attacker_access),
                 severity=severity_for(risk_score(proposed.impact, proposed.attacker_access)),
                 confidence_score=confidence_score(proposed.evidence),

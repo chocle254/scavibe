@@ -21,7 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 import httpx
 
-from scavibe.agents import AgentProtocolError, AuditOrchestrator, NvidiaNimGateway, NvidiaNimSettings, SpecialistAgent
+from scavibe.agents import AgentProtocolError, AuditOrchestrator, OpenAIGateway, OpenAISettings, SpecialistAgent
 from scavibe.contracts import (
     AgentReport,
     AuditContext,
@@ -77,6 +77,7 @@ from scavibe.vercel_sandbox import (
     delete_sandbox,
     get_sandbox,
 )
+from scavibe.security_poc import confirm_security_findings
 
 
 def configured_origins() -> list[str]:
@@ -229,6 +230,16 @@ class VercelSandboxLoadTestRequest(BaseModel):
     concurrent_users: int = 100
     duration_seconds: int = 60
     jurisdictions: list[str] = []
+    audit_id: str | None = None
+    audit_pin: str | None = None
+
+
+class VercelSandboxSecurityAuditRequest(BaseModel):
+    """A security audit that may dynamically confirm candidates only on a signed sandbox."""
+
+    repository_url: HttpUrl
+    app_url: HttpUrl | None = None
+    ticket: str = Field(min_length=20, max_length=4_096)
     audit_id: str | None = None
     audit_pin: str | None = None
 
@@ -439,11 +450,14 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
     if _optional_url(context.app_url) != _optional_url(job.app_url):
         raise HTTPException(status_code=422, detail="context.app_url must equal the app_url used to create the audit")
     try:
-        settings = NvidiaNimSettings.from_environment()
+        settings = OpenAISettings.from_environment()
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    pipeline = AuditOrchestrator(NvidiaNimGateway(settings))
-    result = await pipeline.run(context)
+    gateway = OpenAIGateway(settings)
+    try:
+        result = await AuditOrchestrator(gateway).run(context)
+    finally:
+        await gateway.aclose()
     job.status = "completed" if all(item.status != "failed" for item in result.stage_results) else "failed"
     return result
 
@@ -651,12 +665,10 @@ def _performance_report(
     )
 
 
-async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
+async def _analyze_specialist_with_gateway(stage: Stage, context: AuditContext, gateway: OpenAIGateway, *, on_phase=None) -> AgentReport:
+    """Analyze one stage with a supplied gateway while preserving validation semantics."""
     try:
-        settings = NvidiaNimSettings.from_environment()
-        report = await SpecialistAgent(stage, NvidiaNimGateway(settings)).analyze(context, on_phase=on_phase)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+        report = await SpecialistAgent(stage, gateway).analyze(context, on_phase=on_phase)
     except AgentProtocolError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     if not context.source_content_complete:
@@ -664,6 +676,18 @@ async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=No
             "Only the capped source-file selection was supplied to this stage; repository-wide absence claims are not valid."
         )
     return report
+
+
+async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
+    try:
+        settings = OpenAISettings.from_environment()
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    gateway = OpenAIGateway(settings)
+    try:
+        return await _analyze_specialist_with_gateway(stage, context, gateway, on_phase=on_phase)
+    finally:
+        await gateway.aclose()
 
 
 def _sse_data(event: dict) -> str:
@@ -893,6 +917,81 @@ async def audit_security(request: StageAuditRequest) -> StageAuditResponse:
     snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(request, [])
     report = await _specialist_report(Stage.SECURITY, snapshot.context)
     return StageAuditResponse(stage=Stage.SECURITY, audit_id=audit_id, audit_pin=audit_pin, repository=_repository_summary(snapshot), report=report)
+
+
+@app.post("/sandboxes/vercel/{deployment_id}/security-audit", response_model=StageAuditResponse)
+async def audit_vercel_sandbox_security(
+    deployment_id: str,
+    request: VercelSandboxSecurityAuditRequest,
+    x_scavibe_sandbox_key: str | None = Header(default=None),
+) -> StageAuditResponse:
+    """Confirm only safe security candidates against one signed disposable sandbox.
+
+    The supplied deployment URL is never accepted from the client. The signed
+    ticket resolves the target, and the whole disposable project is deleted
+    after the audit whether confirmation succeeds or fails.
+    """
+    _require_sandbox_access(x_scavibe_sandbox_key)
+    try:
+        sandbox = await get_sandbox(request.ticket)
+    except VercelSandboxError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    if sandbox.deployment_id != deployment_id:
+        raise HTTPException(status_code=422, detail="sandbox ticket does not match the requested deployment")
+    if sandbox.ready_state.upper() != "READY" or sandbox.deployment_url is None:
+        raise HTTPException(status_code=409, detail=f"sandbox deployment is {sandbox.ready_state}; security proof-of-concept validation starts only after Vercel reports READY")
+    stage_request = StageAuditRequest(
+        repository_url=request.repository_url,
+        app_url=request.app_url,
+        sandbox_authorized=True,
+        audit_id=request.audit_id,
+        audit_pin=request.audit_pin,
+    )
+    result: StageAuditResponse | None = None
+    teardown = "deleted"
+    try:
+        snapshot, audit_id, audit_pin = await _pinned_repository_snapshot(
+            stage_request,
+            [],
+            initial_commit_sha=sandbox.commit_sha,
+        )
+        if snapshot.context.commit_sha != sandbox.commit_sha:
+            raise HTTPException(status_code=422, detail="signed audit pin commit does not match the signed sandbox commit")
+        try:
+            settings = OpenAISettings.from_environment()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+        gateway = OpenAIGateway(settings)
+        try:
+            report = await _analyze_specialist_with_gateway(Stage.SECURITY, snapshot.context, gateway)
+            findings = await confirm_security_findings(
+                findings=report.findings,
+                sandbox_url=sandbox.deployment_url,
+                source_by_path={source.path: source.content for source in snapshot.context.source_files},
+                gateway=gateway,
+            )
+        finally:
+            await gateway.aclose()
+        result = StageAuditResponse(
+            stage=Stage.SECURITY,
+            audit_id=audit_id,
+            audit_pin=audit_pin,
+            repository=_repository_summary(snapshot),
+            report=report.model_copy(update={"findings": findings}),
+            sandbox_teardown=teardown,
+        )
+    except RepositoryIntakeError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    finally:
+        try:
+            await delete_sandbox(request.ticket)
+        except VercelSandboxError as teardown_error:
+            teardown = f"delete failed: {teardown_error}"
+    if result is None:
+        raise HTTPException(status_code=500, detail="security sandbox audit completed without a report")
+    if teardown != "deleted":
+        result.sandbox_teardown = teardown
+    return result
 
 
 @app.post("/audit-stages/security/stream")

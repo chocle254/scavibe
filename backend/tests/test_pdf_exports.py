@@ -17,8 +17,9 @@ from main import (
     download_security_pdf,
     _stage_pdf_bytes,
 )
-from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceInventory, EvidenceKind, Finding, Impact, RampAssessment, RuntimeMeasurement, Severity, SourceFile, Stage
+from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, Impact, RampAssessment, RuntimeMeasurement, SecurityPocExecution, Severity, SourceFile, Stage
 from scavibe.pdf_reports import build_stage_pdf, generate_pdf_report
+from scavibe.reporting import report_markdown
 import scavibe.pdf_reports as pdf_reports
 
 
@@ -69,6 +70,47 @@ async def response_bytes(response) -> bytes:
 
 
 class PdfExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_security_exports_show_poc_audit_trail_and_confirmed_findings_first(self) -> None:
+        candidate = report_for(Stage.SECURITY).findings[0].model_copy(
+            update={
+                "title": "Candidate static finding",
+                "exploitability_status": ExploitabilityStatus.CANDIDATE_UNCONFIRMED,
+            }
+        )
+        confirmed = report_for(Stage.SECURITY).findings[0].model_copy(
+            update={
+                "title": "Confirmed sandbox finding",
+                "exploitability_status": ExploitabilityStatus.CONFIRMED_EXPLOITABLE,
+                "poc_execution": SecurityPocExecution(
+                    proposed_test_code="await client.get('/profile')",
+                    executed_test_code="response = await client.get('https://sandbox.example.vercel.app/profile')",
+                    execution_state="executed",
+                    request_method="GET",
+                    request_path="/profile",
+                    expected_status_code=200,
+                    expected_response_marker="private_email",
+                    response_status_code=200,
+                    response_excerpt='{"private_email":"audit@example.test"}',
+                    response_sha256="a" * 64,
+                    reason="The validated GET probe returned the planned status and the source-cited response marker.",
+                ),
+            }
+        )
+        report = report_for(Stage.SECURITY, findings=[candidate, confirmed])
+        markdown = report_markdown(report)
+        self.assertLess(markdown.index("Confirmed sandbox finding"), markdown.index("Candidate static finding"))
+        self.assertIn("Confirmed exploitable", markdown)
+        self.assertIn("Sandbox proof-of-concept audit trail", markdown)
+        self.assertIn("Captured response excerpt", markdown)
+
+        with patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph:
+            document = build_stage_pdf(report)
+        rendered_text = [call.args[0] for call in paragraph.call_args_list]
+        self.assertTrue(document.startswith(b"%PDF-"))
+        self.assertLess(rendered_text.index("Confirmed sandbox finding"), rendered_text.index("Candidate static finding"))
+        self.assertIn("Confirmed exploitable", rendered_text)
+        self.assertIn("Sandbox proof-of-concept audit trail", rendered_text)
+
     async def test_all_pdf_routes_share_the_single_generator(self) -> None:
         for stage in (Stage.PERFORMANCE, Stage.SECURITY, Stage.LEGAL):
             report = report_for(stage)

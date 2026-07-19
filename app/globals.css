@@ -723,6 +723,12 @@ a { color: inherit; }
 .finding h3 { margin: 7px 0 5px; color: #e6f0e9; font-size: 11px; line-height: 1.4; }
 .finding p { margin: 4px 0; color: #a9b7af; font-size: 10px; line-height: 1.6; }
 .finding strong { display: block; margin-top: 9px; color: #dde9e1; font-size: 8px; letter-spacing: .5px; text-transform: uppercase; }
+.poc-status { display: inline-flex; align-items: center; gap: 6px; margin: 7px 0 2px !important; border-radius: 999px; padding: 4px 8px; font: 8px 'DM Mono', monospace !important; letter-spacing: .35px; text-transform: uppercase; }
+.poc-status.confirmed { border: 1px solid rgba(130, 245, 189, .38); background: rgba(130, 245, 189, .1); color: var(--lime) !important; }
+.poc-status.candidate { border: 1px solid rgba(255, 206, 115, .34); background: rgba(255, 206, 115, .08); color: var(--gold) !important; }
+.poc-audit { margin-top: 11px; border-top: 1px solid var(--line); padding-top: 9px; }
+.poc-audit summary { color: #dbe8df; cursor: pointer; font: 8px 'DM Mono', monospace; letter-spacing: .45px; text-transform: uppercase; }
+.poc-audit pre { max-height: 250px; overflow: auto; border: 1px solid rgba(148, 174, 158, .17); background: #0a100d; color: #bfcec3; padding: 9px; font: 8px/1.55 'DM Mono', monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .source-fix { display: grid; gap: 8px; margin-top: 12px; border-top: 1px solid var(--line); padding-top: 11px; }
 .source-fix > b { color: var(--lime); font: 8px 'DM Mono', monospace; letter-spacing: .55px; text-transform: uppercase; }
 .source-fix > p { margin: 0; color: #9aaba0; font-size: 9px; line-height: 1.55; }

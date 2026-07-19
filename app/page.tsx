@@ -26,6 +26,20 @@ type Finding = {
   risk_score: number;
   confidence_score: number;
   evidence: Evidence[];
+  exploitability_status?: "confirmed_exploitable" | "candidate_unconfirmed" | null;
+  poc_execution?: {
+    proposed_test_code: string;
+    executed_test_code: string | null;
+    execution_state: "not_executed" | "executed";
+    request_method: "GET" | null;
+    request_path: string | null;
+    expected_status_code: number | null;
+    expected_response_marker: string | null;
+    response_status_code: number | null;
+    response_excerpt: string | null;
+    response_sha256: string | null;
+    reason: string;
+  } | null;
 };
 type RampAssessment = {
   tested_range: number[];
@@ -383,8 +397,8 @@ export default function Home() {
     return result;
   }
 
-  async function createSandbox(): Promise<VercelSandbox> {
-    addTrace("performance", "Creating disposable Vercel sandbox from the pinned repository.");
+  async function createSandbox(targetStage: Stage): Promise<VercelSandbox> {
+    addTrace(targetStage, "Creating disposable Vercel sandbox from the pinned repository.");
     const created = await post<VercelSandbox>("/sandboxes/vercel", { repository_url: repository.trim(), authorized_deployment: true });
     let sandbox = created;
     for (let attempt = 1; attempt <= 36; attempt += 1) {
@@ -400,17 +414,32 @@ export default function Home() {
     throw new Error("Vercel did not report a ready sandbox within 180 seconds. No load traffic was sent.");
   }
 
-  async function cleanupSandbox(sandbox: VercelSandbox) {
+  async function cleanupSandbox(sandbox: VercelSandbox, targetStage: Stage) {
     try {
       const response = await fetch(apiUrl("/sandboxes/vercel/" + sandbox.deployment_id) + "?ticket=" + encodeURIComponent(sandbox.ticket), { method: "DELETE" });
       if (response.status !== 204) throw new Error("Sandbox deletion returned HTTP " + response.status);
       setSandboxStatus("Disposable sandbox deleted after the ramp.");
-      addTrace("performance", "Disposable sandbox deleted.", "success");
+      addTrace(targetStage, "Disposable sandbox deleted.", "success");
     } catch (cleanupError) {
       const message = cleanupError instanceof Error ? cleanupError.message : "Sandbox cleanup failed.";
       setSandboxStatus(message);
-      addTrace("performance", message, "warn");
+      addTrace(targetStage, message, "warn");
     }
+  }
+
+  async function runSandboxSecurity(sandbox: VercelSandbox): Promise<StageResult> {
+    addTrace("security", "Running constrained GET proof-of-concept validation only against the signed disposable sandbox.");
+    setProgress((current) => ({ ...current, security: 70 }));
+    const result = await post<StageResult>("/sandboxes/vercel/" + sandbox.deployment_id + "/security-audit", {
+      repository_url: repository.trim(),
+      app_url: appUrl.trim() || undefined,
+      ticket: sandbox.ticket,
+      audit_id: auditId || undefined,
+      audit_pin: auditPin || undefined,
+    });
+    setProgress((current) => ({ ...current, security: 100 }));
+    addTrace("security", "Sandbox confirmation complete: confirmed findings are sorted ahead of unconfirmed candidates.", "success");
+    return result;
   }
 
   async function runStage() {
@@ -437,19 +466,26 @@ export default function Home() {
       setSpecialistPhases((current) => ({ ...current, [stage]: {} }));
     }
     let sandbox: VercelSandbox | null = null;
+    let sandboxCleanupManagedByServer = false;
     try {
       let result: StageResult;
       if (stage === "performance") {
         let target = sandboxUrl.trim();
         if (useScavibeSandbox) {
           setSandboxStatus("Creating isolated Vercel preview with no production environment variables.");
-          sandbox = await createSandbox();
+          sandbox = await createSandbox("performance");
           target = sandbox.deployment_url || "";
           setSandboxUrl(target);
           setSandboxStatus("Sandbox ready. Starting the fixed 10–200 user ramp.");
         }
         if (!target) throw new Error("A ready HTTPS sandbox URL is required.");
         result = await runRamp(target);
+      } else if (stage === "security" && authorized && useScavibeSandbox) {
+        setSandboxStatus("Creating an isolated Vercel preview for source-evidenced, read-only security confirmation.");
+        sandbox = await createSandbox("security");
+        sandboxCleanupManagedByServer = true;
+        result = await runSandboxSecurity(sandbox);
+        sandbox = null;
       } else {
         result = await runSpecialist(stage);
       }
@@ -469,7 +505,7 @@ export default function Home() {
       setError(message);
       addTrace(stage, message, "error");
     } finally {
-      if (sandbox) await cleanupSandbox(sandbox);
+      if (sandbox && !sandboxCleanupManagedByServer) await cleanupSandbox(sandbox, stage || "performance");
       setOperation("idle");
     }
   }
@@ -607,7 +643,7 @@ export default function Home() {
           <label>Authorized sandbox URL {useScavibeSandbox ? <small>(manual alternative)</small> : null}<input type="url" value={sandboxUrl} onChange={(event) => setSandboxUrl(event.target.value)} placeholder="https://preview-your-app.vercel.app" required={!useScavibeSandbox} /></label>
           {suggesting ? <p className="subtle">Reading deployment suggestions…</p> : null}
           {suggestions.length > 0 ? <div className="suggestions"><span>Commit-aware deployment suggestions</span>{suggestions.map((item) => <button key={item.url} type="button" onClick={() => setSandboxUrl(item.url)}><Icon name="check" /><b>{item.provider}</b><code>{item.url}</code><small>{item.environment} · {item.commit_sha.slice(0, 8)}</small></button>)}</div> : null}
-          <label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own this sandbox or have explicit authorization to test it. The performance stage sends bounded GET requests only to the sandbox.</span></label>
+          <label className="checkline"><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>I own this sandbox or have explicit authorization to test it. Scavibe sends bounded GET requests only to the sandbox for performance testing and safe security confirmation.</span></label>
           {error ? <p className="form-error">{error}</p> : null}
           <button className="primary full" type="submit">Open audit workspace <Icon name="arrow" /></button>
         </form>
@@ -640,10 +676,10 @@ export default function Home() {
             <StageVisual stage={stage} progress={progress[stage]} lanes={lanes} assessment={breakingPoint || activeResult?.report.ramp_assessment || null} phases={stage === "performance" ? undefined : specialistPhases[stage]} auditing={operation === "auditing"} />
             <div className="control-board">
               {stage === "performance" ? <><div className="fixed-spec"><span>Fixed exploratory schedule</span><b>10 → 200 users</b><small>9 × 12-second steps · 60-second confirmation · GET / only</small></div><div className="fixed-spec"><span>Finding admission gate</span><b>100 users · 60s · 20 samples</b><small>Lower-load results remain recorded but cannot create a performance finding.</small></div>{sandboxStatus ? <p className="sandbox-status"><Icon name="lock" /> {sandboxStatus}</p> : null}</> : null}
-              {stage === "security" ? <p className="stage-explainer">The specialist follows OWASP-oriented checks over the pinned source evidence. Every filed finding requires exact source evidence.</p> : null}
+              {stage === "security" ? <><p className="stage-explainer">The specialist follows OWASP-oriented checks over the pinned source evidence. Every filed finding requires exact source evidence. With sandbox authorization, Scavibe then runs only validated read-only GET probes against a signed disposable sandbox; all other candidates remain unconfirmed.</p>{sandboxStatus ? <p className="sandbox-status"><Icon name="lock" /> {sandboxStatus}</p> : null}</> : null}
               {stage === "legal" ? <><p className="stage-explainer">The data-handling and consent audit maps observed product signals to specific recommendations. It does not certify compliance or replace legal counsel.</p><div className="jurisdiction-row">{["KE", "EU", "US-CA"].map((item) => <button key={item} type="button" className={jurisdictions.includes(item) ? "selected" : ""} onClick={() => toggleJurisdiction(item)}>{jurisdictions.includes(item) ? <Icon name="check" /> : null}{item}</button>)}</div></> : null}
             </div>
-            <button className="primary full run-button" disabled={!canRun} onClick={() => void runStage()}>{operation === "auditing" ? "Processing verified evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized load ramp" : stage === "legal" ? "Start data-handling and consent audit" : "Start security review"} {operation === "auditing" ? <Icon name="terminal" /> : activeResult ? <Icon name="refresh" /> : <Icon name="arrow" />}</button>
+            <button className="primary full run-button" disabled={!canRun} onClick={() => void runStage()}>{operation === "auditing" ? "Processing verified evidence…" : activeResult ? "Run this stage again" : stage === "performance" ? "Run authorized load ramp" : stage === "legal" ? "Start data-handling and consent audit" : authorized && useScavibeSandbox ? "Run security review + safe sandbox confirmation" : "Start static security review"} {operation === "auditing" ? <Icon name="terminal" /> : activeResult ? <Icon name="refresh" /> : <Icon name="arrow" />}</button>
             {error ? <p className="form-error panel-error">{error}</p> : null}
           </section>
           <Terminal stage={stage} trace={trace} coverage={coverage[stage]} progress={progress[stage]} auditing={operation === "auditing"} />
@@ -675,7 +711,7 @@ function ReportPanel({ result, busy, approvals, urls, onApprovalChange, onCreate
   const report = result.report;
   const measurement = result.measurement;
   const assessment = report.ramp_assessment;
-  return <section className="report-panel"><header><div><span className="eyebrow">Verified report</span><h2>{report.stage === "legal" ? "data-handling and consent verdict" : report.stage + " verdict"}</h2></div><b>{report.findings.length} finding{report.findings.length === 1 ? "" : "s"}</b></header>{measurement ? <div className="metric-grid"><div><span>Confirmed load</span><b>{measurement.concurrent_users}</b><small>users</small></div><div><span>P95 latency</span><b>{measurement.p95_latency_ms === null ? "N/A" : measurement.p95_latency_ms}</b><small>{measurement.p95_latency_ms === null ? "0 successes" : "ms"}</small></div><div><span>Error rate</span><b>{measurement.error_rate_percent}</b><small>%</small></div></div> : null}{assessment ? <p className="breakpoint-readout">{assessment.breaking_point_concurrent_users === null ? "Confirmed ramp result: no breaking point identified from 10 to 200 users." : "Confirmed ramp result: " + assessment.metric + "=" + assessment.observed_value + " at " + assessment.breaking_point_concurrent_users + " users (threshold " + assessment.threshold + ")."}</p> : null}<p className="report-summary">{report.summary}</p><div className="finding-list">{report.findings.length === 0 ? <p className="no-findings"><Icon name="check" /> No evidence-backed findings were filed.</p> : report.findings.map((finding, findingIndex) => { const offer = autoFixOffer(report.stage, finding); const key = report.stage + ":" + findingIndex; return <article className={["finding", finding.severity].join(" ")} key={finding.title}><div><span>{finding.severity}</span><b>{finding.risk_score}/100 · {finding.confidence_score}% confidence</b></div><h3>{finding.title}</h3><p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p><details><summary>Exact evidence</summary><ul>{finding.evidence.map((item, index) => <li key={item.kind + index}>{item.kind === "source" ? item.file_path + " lines " + item.start_line + "-" + item.end_line + ": " + item.quote : item.kind === "runtime" ? item.measurement_id + " " + item.endpoint + ": " + item.metric + "=" + item.observed_value + ", threshold=" + item.threshold : "Manifest path: " + item.file_path}</li>)}</ul></details>{offer ? <div className="source-fix"><b>Bounded source change</b><p>{offer.fixType === "rate_limit_middleware" ? "Creates a FastAPI middleware at 60 requests per 60 seconds per IP, a conservative starting point to review." : "Creates one React/Next checkbox component and integrates it into the cited form."}</p><label className="checkline"><input type="checkbox" checked={Boolean(approvals[key])} onChange={(event) => onApprovalChange(key, event.target.checked)} /><span>This will generate real source code and open a pull request containing an actual code change to your repository. Review the diff carefully before merging — I am not responsible for reviewing this code for you.</span></label><button className="secondary" disabled={busy || !approvals[key]} onClick={() => onCreateSourceFix(findingIndex, offer.fixType)}><Icon name="branch" /> {offer.label}</button>{urls[key] ? <a className="pr-link" href={urls[key]} target="_blank" rel="noreferrer">Open source-fix PR <Icon name="arrow" /></a> : null}</div> : null}</article>; })}</div><details className="limitations"><summary>Limitations ({report.limitations.length})</summary><ul>{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></section>;
+  return <section className="report-panel"><header><div><span className="eyebrow">Verified report</span><h2>{report.stage === "legal" ? "data-handling and consent verdict" : report.stage + " verdict"}</h2></div><b>{report.findings.length} finding{report.findings.length === 1 ? "" : "s"}</b></header>{measurement ? <div className="metric-grid"><div><span>Confirmed load</span><b>{measurement.concurrent_users}</b><small>users</small></div><div><span>P95 latency</span><b>{measurement.p95_latency_ms === null ? "N/A" : measurement.p95_latency_ms}</b><small>{measurement.p95_latency_ms === null ? "0 successes" : "ms"}</small></div><div><span>Error rate</span><b>{measurement.error_rate_percent}</b><small>%</small></div></div> : null}{assessment ? <p className="breakpoint-readout">{assessment.breaking_point_concurrent_users === null ? "Confirmed ramp result: no breaking point identified from 10 to 200 users." : "Confirmed ramp result: " + assessment.metric + "=" + assessment.observed_value + " at " + assessment.breaking_point_concurrent_users + " users (threshold " + assessment.threshold + ")."}</p> : null}<p className="report-summary">{report.summary}</p><div className="finding-list">{report.findings.length === 0 ? <p className="no-findings"><Icon name="check" /> No evidence-backed findings were filed.</p> : report.findings.map((finding, findingIndex) => { const offer = autoFixOffer(report.stage, finding); const key = report.stage + ":" + findingIndex; const exploitability = finding.exploitability_status === "confirmed_exploitable" ? "Confirmed exploitable" : finding.exploitability_status === "candidate_unconfirmed" ? "Candidate — unconfirmed" : null; const poc = finding.poc_execution; return <article className={["finding", finding.severity].join(" ")} key={finding.title}><div><span>{finding.severity}</span><b>{finding.risk_score}/100 · {finding.confidence_score}% confidence</b></div><h3>{finding.title}</h3>{exploitability ? <p className={finding.exploitability_status === "confirmed_exploitable" ? "poc-status confirmed" : "poc-status candidate"}>{exploitability}</p> : null}<p>{finding.statement}</p><strong>Required change</strong><p>{finding.remediation}</p><details><summary>Exact evidence</summary><ul>{finding.evidence.map((item, index) => <li key={item.kind + index}>{item.kind === "source" ? item.file_path + " lines " + item.start_line + "-" + item.end_line + ": " + item.quote : item.kind === "runtime" ? item.measurement_id + " " + item.endpoint + ": " + item.metric + "=" + item.observed_value + ", threshold=" + item.threshold : "Manifest path: " + item.file_path}</li>)}</ul></details>{poc ? <details className="poc-audit"><summary>Sandbox proof-of-concept audit trail</summary><p><b>Execution:</b> {poc.execution_state} {poc.request_method && poc.request_path ? "· " + poc.request_method + " " + poc.request_path : ""}</p><p>{poc.reason}</p><p><b>Model-proposed test code</b></p><pre>{poc.proposed_test_code}</pre>{poc.executed_test_code ? <><p><b>Executed fixed-template test code</b></p><pre>{poc.executed_test_code}</pre></> : null}{poc.response_status_code !== null ? <p><b>Observed HTTP status:</b> {poc.response_status_code}</p> : null}{poc.response_sha256 ? <p><b>Response excerpt SHA-256:</b> <code>{poc.response_sha256}</code></p> : null}{poc.response_excerpt !== null ? <><p><b>Captured response excerpt</b></p><pre>{poc.response_excerpt}</pre></> : null}</details> : null}{offer ? <div className="source-fix"><b>Bounded source change</b><p>{offer.fixType === "rate_limit_middleware" ? "Creates a FastAPI middleware at 60 requests per 60 seconds per IP, a conservative starting point to review." : "Creates one React/Next checkbox component and integrates it into the cited form."}</p><label className="checkline"><input type="checkbox" checked={Boolean(approvals[key])} onChange={(event) => onApprovalChange(key, event.target.checked)} /><span>This will generate real source code and open a pull request containing an actual code change to your repository. Review the diff carefully before merging — I am not responsible for reviewing this code for you.</span></label><button className="secondary" disabled={busy || !approvals[key]} onClick={() => onCreateSourceFix(findingIndex, offer.fixType)}><Icon name="branch" /> {offer.label}</button>{urls[key] ? <a className="pr-link" href={urls[key]} target="_blank" rel="noreferrer">Open source-fix PR <Icon name="arrow" /></a> : null}</div> : null}</article>; })}</div><details className="limitations"><summary>Limitations ({report.limitations.length})</summary><ul>{report.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details></section>;
 }
 
 function EvidencePanel({ result, coverage }: { result?: StageResult; coverage?: Coverage }) {
