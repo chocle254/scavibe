@@ -107,6 +107,8 @@ def evidence_inventory_markdown(report: AgentReport) -> list[str]:
 def report_markdown(report: AgentReport) -> str:
     """Create the evidence-backed Markdown representation of an AgentReport."""
     lines = [f"# Scavibe {STAGE_AUDIT_LABELS[report.stage]}", "", report.summary, "", "## Findings", ""]
+    if report.analysis_engine is not None:
+        lines[3:3] = [f"Analysis engine: `{report.analysis_engine}`", ""]
     if not report.findings:
         lines.extend(["No evidence-backed findings were returned for the supplied evidence set.", ""])
     for finding in ordered_findings(report.findings):

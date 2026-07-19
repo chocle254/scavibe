@@ -224,6 +224,7 @@ class AgentReport(BaseModel):
     findings: list[Finding]
     limitations: list[str]
     evidence_commit_sha: str
+    analysis_engine: Annotated[str | None, Field(default=None, min_length=1, max_length=160)]
     ramp_assessment: RampAssessment | None = None
     evidence_inventory: EvidenceInventory | None = None
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

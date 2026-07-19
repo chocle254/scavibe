@@ -2,7 +2,8 @@
 
 **AI-powered pre-launch audit for vibe-coded apps.**
 
-Built using Codex + GPT-5.6.
+Built using Codex. GPT-5.6 Terra is the primary audit provider; NVIDIA NIM is
+an explicitly labeled credit-limited fallback.
 
 ---
 
@@ -127,6 +128,19 @@ repository path manifest, sandbox measurements, and jurisdictions. GitHub
 cloning and sandbox provisioning remain separate integrations; the API does
 not imitate either one.
 
+### Audit-provider selection
+
+`SCAVIBE_LLM_PROVIDER=openai` is the default and sends specialist audit prompts
+to OpenAI's Responses API using GPT-5.6 Terra (`gpt-5.6-terra`).
+`SCAVIBE_LLM_PROVIDER=nvidia` sends the same validated specialist prompts to
+NVIDIA NIM's Chat Completions API instead. It is a fallback for a credit-limited
+deployment, not GPT-5.6 output. Every specialist report and PDF identifies the
+exact analysis engine that produced it.
+
+The performance ramp does not use either LLM. It is a deterministic, bounded
+HTTP GET measurement against the authorized disposable sandbox; the report
+identifies it as such.
+
 ---
 
 ## Legal Disclaimer
@@ -141,7 +155,7 @@ Scavibe does not draft policy text, terms, or other legal documents. Its data-ha
 |---|---|
 | Frontend | Next.js 14 (App Router) + Tailwind CSS, deployed to Vercel |
 | Backend | FastAPI (Python), async background tasks, deployed to Railway |
-| LLM | OpenAI Responses API with GPT-5.6 Terra (`gpt-5.6-terra`) — powers all three agent stages |
+| Specialist audit provider | OpenAI Responses API with GPT-5.6 Terra (`gpt-5.6-terra`) by default; NVIDIA NIM only when explicitly selected and labeled in every report |
 | Load testing | Async HTTPX bounded GET ramp against an authorized sandbox deployment |
 | GitHub integration | GitHub API — reads repos, opens pull requests |
 | Storage | PDFs are generated per request; the backend does not claim persistent report storage |
@@ -155,13 +169,19 @@ Scavibe does not draft policy text, terms, or other legal documents. Its data-ha
 - Node.js 18+
 - Python 3.11+
 - A GitHub personal access token (repo scope)
-- An OpenAI API key with access to GPT-5.6 Terra
+- One provider credential: an OpenAI API key with GPT-5.6 Terra access, or an NVIDIA NIM API key for the explicitly labeled fallback
 
 ### Environment Variables
 
 **Backend (`.env`)**
 ```
+# Select exactly one provider: openai or nvidia.
+SCAVIBE_LLM_PROVIDER=openai
 OPENAI_API_KEY=your_openai_project_key
+# NVIDIA fallback example:
+# SCAVIBE_LLM_PROVIDER=nvidia
+# NVIDIA_API_KEY=your_nvidia_nim_key
+# SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5
 GITHUB_TOKEN=ghp_...
 BLOB_READ_WRITE_TOKEN=...
 ```

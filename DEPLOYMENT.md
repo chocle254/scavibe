@@ -19,7 +19,7 @@ frontend remains the fallback if Vercel Services is unavailable.
 5. Deploy a Preview environment and record its exact `https://...vercel.app` URL.
 
 The root `vercel.json` routes `/api/*` to FastAPI and all other paths to
-Next.js. Do not expose `OPENAI_API_KEY` to client-side Vercel variables.
+Next.js. Do not expose provider API keys to client-side Vercel variables.
 
 ## 2. Configure Vercel variables
 
@@ -27,7 +27,10 @@ Add these server-side variables to the Vercel project:
 
 | Variable | Required value |
 | --- | --- |
-| `OPENAI_API_KEY` | Server-side OpenAI API key with access to `gpt-5.6-terra`. |
+| `SCAVIBE_LLM_PROVIDER` | Exactly `openai` (default) or `nvidia`. This explicit selection controls every specialist stage. |
+| `OPENAI_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=openai`; server-side key with access to `gpt-5.6-terra`. |
+| `NVIDIA_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=nvidia`; server-side NVIDIA NIM key. NVIDIA output is labeled as NVIDIA NIM, not GPT-5.6. |
+| `SCAVIBE_NVIDIA_MODEL` | Optional only when `SCAVIBE_LLM_PROVIDER=nvidia`; default `nvidia/llama-3.3-nemotron-super-49b-v1.5`. |
 | `SCAVIBE_ALLOWED_ORIGINS` | The exact Vercel preview origin, such as `https://scavibe-git-main-team.vercel.app`. |
 | `GITHUB_TOKEN` | Required for private-repository intake and for user-approved draft PR creation. Public repository intake works without it, subject to GitHub's unauthenticated API limit. |
 | `BLOB_READ_WRITE_TOKEN` | Not required for the current agent backbone. |
@@ -118,7 +121,9 @@ code. It contains only a public route, never an API key.
 
 The API fetches public GitHub repositories at a pinned commit, runs bounded GET
 load tests against user-authorized HTTPS sandbox URLs, and calls specialist
-agents after `OPENAI_API_KEY` is configured. When the sandbox variables are
+agents after the credential for the explicitly selected provider is configured.
+Load testing is deterministic HTTP measurement; it is not NVIDIA or GPT-5.6
+inference. When the sandbox variables are
 configured, a trusted user can also create a no-secret Vercel project from the
 pinned commit, test it only after Vercel reports `READY`, and trigger project
 deletion after the test. The browser polls readiness for exactly 180 seconds.

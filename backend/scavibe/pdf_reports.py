@@ -368,6 +368,7 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
             [
                 _paragraph(f"Generated at: {timestamp}", styles["muted"]),
                 _paragraph(f"Evidence commit: {report.evidence_commit_sha}", styles["muted"]),
+                *([_paragraph(f"Analysis engine: {report.analysis_engine}", styles["muted"])] if report.analysis_engine is not None else []),
                 _paragraph(report.summary, styles["body"]),
             ],
             content_width,

@@ -1,4 +1,4 @@
-"""OpenAI Responses API configuration and transport for Scavibe specialists."""
+"""Explicit OpenAI and NVIDIA NIM transports for Scavibe specialists."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 
@@ -18,12 +18,23 @@ class AgentProtocolError(RuntimeError):
 class Gateway(Protocol):
     async def generate(self, *, system_prompt: str, input_json: str) -> str: ...
 
+    async def aclose(self) -> None: ...
+
+    @property
+    def audit_engine_label(self) -> str: ...
+
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-5.6-terra"
 OPENAI_REASONING_EFFORT = "medium"
 MAX_OPENAI_OUTPUT_TOKENS = 2048
-LOGGER = logging.getLogger("scavibe.openai")
+NVIDIA_NIM_CHAT_COMPLETIONS_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+# Assumption: this current NIM model is the default because NVIDIA documents it
+# at the Chat Completions endpoint. Deployments can pin another NIM model with
+# SCAVIBE_NVIDIA_MODEL.
+DEFAULT_NVIDIA_NIM_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+MAX_NVIDIA_NIM_OUTPUT_TOKENS = 2048
+LOGGER = logging.getLogger("scavibe.agents.gateway")
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,32 @@ class OpenAISettings:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required to run an audit")
         return cls(api_key=api_key)
+
+
+@dataclass(frozen=True)
+class NvidiaNimSettings:
+    """Server-only NVIDIA NIM configuration for an explicit fallback selection."""
+
+    api_key: str
+    model: str
+
+    @classmethod
+    def from_environment(cls) -> "NvidiaNimSettings":
+        api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+        model = os.environ.get("SCAVIBE_NVIDIA_MODEL", DEFAULT_NVIDIA_NIM_MODEL).strip()
+        if not api_key:
+            raise RuntimeError("NVIDIA_API_KEY is required when SCAVIBE_LLM_PROVIDER=nvidia")
+        if not model:
+            raise RuntimeError("SCAVIBE_NVIDIA_MODEL cannot be empty")
+        return cls(api_key=api_key, model=model)
+
+
+def selected_llm_provider() -> Literal["openai", "nvidia"]:
+    """Read the deliberate server-side provider choice; never silently fail over."""
+    provider = os.environ.get("SCAVIBE_LLM_PROVIDER", "openai").strip().lower()
+    if provider not in {"openai", "nvidia"}:
+        raise RuntimeError("SCAVIBE_LLM_PROVIDER must be exactly openai or nvidia")
+    return provider  # type: ignore[return-value]
 
 
 class OpenAIGateway:
@@ -88,6 +125,62 @@ class OpenAIGateway:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    @property
+    def audit_engine_label(self) -> str:
+        return f"OpenAI GPT-5.6 Terra ({OPENAI_MODEL})"
+
+
+class NvidiaNimGateway:
+    """NVIDIA NIM Chat Completions fallback; it does not claim GPT-5.6 output."""
+
+    def __init__(self, settings: NvidiaNimSettings, *, transport: httpx.AsyncBaseTransport | None = None) -> None:
+        self._settings = settings
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(90.0, connect=15.0),
+            max_redirects=0,
+            transport=transport,
+            headers={
+                "Authorization": f"Bearer {settings.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+    async def generate(self, *, system_prompt: str, input_json: str) -> str:
+        """Request one JSON-only draft through NVIDIA's documented Chat Completions API."""
+        payload = {
+            "model": self._settings.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": input_json},
+            ],
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "max_tokens": MAX_NVIDIA_NIM_OUTPUT_TOKENS,
+            "stream": False,
+        }
+        LOGGER.info(
+            "nvidia_nim_chat_completions_request endpoint=%s model=%s max_tokens=%s",
+            NVIDIA_NIM_CHAT_COMPLETIONS_URL,
+            self._settings.model,
+            MAX_NVIDIA_NIM_OUTPUT_TOKENS,
+        )
+        try:
+            response = await self._client.post(NVIDIA_NIM_CHAT_COMPLETIONS_URL, json=payload)
+            response.raise_for_status()
+            content = _nim_message_content(response.json())
+        except (httpx.HTTPError, ValueError) as error:
+            raise AgentProtocolError(f"NVIDIA NIM request failed: {error}") from error
+        if not content:
+            raise AgentProtocolError("NVIDIA NIM returned no message content")
+        return content
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    @property
+    def audit_engine_label(self) -> str:
+        return f"NVIDIA NIM ({self._settings.model})"
+
 
 def _response_output_text(payload: object) -> str | None:
     """Read text from the documented Responses result shape without accepting refusals."""
@@ -111,3 +204,17 @@ def _response_output_text(payload: object) -> str | None:
                 fragments.append(part["text"])
     rendered = "".join(fragments).strip()
     return rendered or None
+
+
+def _nim_message_content(payload: object) -> str | None:
+    """Read the strict first-choice text shape from an OpenAI-compatible NIM result."""
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return None
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return None
+    content = message.get("content")
+    return content.strip() if isinstance(content, str) and content.strip() else None

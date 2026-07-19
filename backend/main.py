@@ -21,7 +21,17 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 import httpx
 
-from scavibe.agents import AgentProtocolError, AuditOrchestrator, OpenAIGateway, OpenAISettings, SpecialistAgent
+from scavibe.agents import (
+    AgentProtocolError,
+    AuditOrchestrator,
+    Gateway,
+    NvidiaNimGateway,
+    NvidiaNimSettings,
+    OpenAIGateway,
+    OpenAISettings,
+    SpecialistAgent,
+    selected_llm_provider,
+)
 from scavibe.contracts import (
     AgentReport,
     AuditContext,
@@ -433,6 +443,14 @@ async def get_audit(audit_id: str) -> AuditJob:
     return job
 
 
+def _configured_gateway() -> Gateway:
+    """Create the single explicitly configured specialist provider for this request."""
+    provider = selected_llm_provider()
+    if provider == "openai":
+        return OpenAIGateway(OpenAISettings.from_environment())
+    return NvidiaNimGateway(NvidiaNimSettings.from_environment())
+
+
 @app.post("/audits/{audit_id}/run", response_model=AuditRun)
 async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
     """Run the validated, read-only analysis pipeline for one pinned commit.
@@ -449,11 +467,10 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
         raise HTTPException(status_code=422, detail="context.repository_url must equal the repository_url used to create the audit")
     if _optional_url(context.app_url) != _optional_url(job.app_url):
         raise HTTPException(status_code=422, detail="context.app_url must equal the app_url used to create the audit")
-    try:
-        settings = OpenAISettings.from_environment()
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    gateway = OpenAIGateway(settings)
+        try:
+            gateway = _configured_gateway()
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
     try:
         result = await AuditOrchestrator(gateway).run(context)
     finally:
@@ -597,6 +614,7 @@ def _performance_report(
             findings=[],
             limitations=limitations,
             evidence_commit_sha=context.commit_sha,
+            analysis_engine="Deterministic sandbox HTTP GET measurement (no LLM)",
             ramp_assessment=ramp_assessment,
             evidence_inventory=EvidenceInventory.from_context(evidence_context),
         )
@@ -660,12 +678,13 @@ def _performance_report(
         findings=findings,
         limitations=limitations,
         evidence_commit_sha=context.commit_sha,
+        analysis_engine="Deterministic sandbox HTTP GET measurement (no LLM)",
         ramp_assessment=ramp_assessment,
         evidence_inventory=EvidenceInventory.from_context(evidence_context),
     )
 
 
-async def _analyze_specialist_with_gateway(stage: Stage, context: AuditContext, gateway: OpenAIGateway, *, on_phase=None) -> AgentReport:
+async def _analyze_specialist_with_gateway(stage: Stage, context: AuditContext, gateway: Gateway, *, on_phase=None) -> AgentReport:
     """Analyze one stage with a supplied gateway while preserving validation semantics."""
     try:
         report = await SpecialistAgent(stage, gateway).analyze(context, on_phase=on_phase)
@@ -675,15 +694,17 @@ async def _analyze_specialist_with_gateway(stage: Stage, context: AuditContext, 
         report.limitations.append(
             "Only the capped source-file selection was supplied to this stage; repository-wide absence claims are not valid."
         )
+    analysis_engine = getattr(gateway, "audit_engine_label", None)
+    if isinstance(analysis_engine, str) and analysis_engine:
+        report = report.model_copy(update={"analysis_engine": analysis_engine})
     return report
 
 
 async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
     try:
-        settings = OpenAISettings.from_environment()
+        gateway = _configured_gateway()
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-    gateway = OpenAIGateway(settings)
     try:
         return await _analyze_specialist_with_gateway(stage, context, gateway, on_phase=on_phase)
     finally:
@@ -958,10 +979,9 @@ async def audit_vercel_sandbox_security(
         if snapshot.context.commit_sha != sandbox.commit_sha:
             raise HTTPException(status_code=422, detail="signed audit pin commit does not match the signed sandbox commit")
         try:
-            settings = OpenAISettings.from_environment()
+            gateway = _configured_gateway()
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
-        gateway = OpenAIGateway(settings)
         try:
             report = await _analyze_specialist_with_gateway(Stage.SECURITY, snapshot.context, gateway)
             findings = await confirm_security_findings(
