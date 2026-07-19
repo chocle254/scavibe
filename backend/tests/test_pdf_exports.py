@@ -175,7 +175,7 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(document.rstrip().endswith(b"%%EOF"))
         self.assertGreater(len(document), 3_000)
 
-    async def test_zero_finding_pdf_reproduces_full_evidence_inventory_and_remediation_decision(self) -> None:
+    async def test_zero_finding_pdf_summarizes_evidence_scope_without_source_dump(self) -> None:
         inventory = EvidenceInventory(
             source_files=[SourceFile(path="src/consent.ts", content="const collectEmail = true;\nreturn collectEmail;")],
             repository_paths=["README.md", "src/consent.ts"],
@@ -197,21 +197,53 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
         )
         report = report_for(Stage.LEGAL, findings=[]).model_copy(update={"evidence_inventory": inventory})
 
-        with (
-            patch("scavibe.pdf_reports._verbatim_evidence_block", wraps=pdf_reports._verbatim_evidence_block) as block,
-            patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph,
-        ):
+        with patch("scavibe.pdf_reports._verbatim_evidence_block", wraps=pdf_reports._verbatim_evidence_block) as block, patch(
+            "scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph
+        ) as paragraph:
             document = build_stage_pdf(report)
 
         blocks = [call.args[0] for call in block.call_args_list]
         rendered_text = [call.args[0] for call in paragraph.call_args_list]
         self.assertTrue(document.startswith(b"%PDF-"))
-        self.assertIn("README.md\nsrc/consent.ts", blocks)
-        self.assertIn("000001 | const collectEmail = true;\n000002 | return collectEmail;", blocks)
+        self.assertEqual(blocks, [])
+        self.assertIn("Evidence summary", rendered_text)
+        self.assertIn("Source files supplied to the audit: 1.", rendered_text)
+        self.assertIn("Repository manifest paths supplied to the audit: 2.", rendered_text)
+        self.assertIn("Full repository source and the full manifest are retained for validation but are not embedded in this export.", rendered_text)
+        self.assertIn("No evidence citation met the finding admission rule. No source excerpt or speculative fix is included.", rendered_text)
+        self.assertNotIn("const collectEmail = true;\nreturn collectEmail;", rendered_text)
+        self.assertNotIn("README.md\nsrc/consent.ts", rendered_text)
         self.assertIn("Remediation plan", rendered_text)
         self.assertIn("No remediation is proposed because no finding met the evidence admission rule. Do not apply a speculative fix from this report.", rendered_text)
         self.assertIn("Measurement ID: ramp_100", rendered_text)
         self.assertIn("KE", rendered_text)
+
+    async def test_pdf_evidence_summary_exports_only_cited_evidence_and_required_change(self) -> None:
+        source = SourceFile(
+            path="src/handlers.ts",
+            content="const unrelated = 'DO_NOT_EXPORT';\nreturn request.headers.get('authorization');\nconst alsoUnrelated = true;",
+        )
+        report = report_for(Stage.SECURITY).model_copy(
+            update={
+                "evidence_inventory": EvidenceInventory(
+                    source_files=[source],
+                    repository_paths=["src/handlers.ts", "src/unused.ts"],
+                    source_content_complete=True,
+                )
+            }
+        )
+
+        with patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph:
+            document = build_stage_pdf(report)
+
+        rendered_text = [call.args[0] for call in paragraph.call_args_list]
+        self.assertTrue(document.startswith(b"%PDF-"))
+        self.assertIn("Finding evidence and required changes", rendered_text)
+        self.assertIn("- `src/handlers.ts` lines 12-12: `return request.headers.get('authorization')`", rendered_text)
+        self.assertIn(report.findings[0].remediation, rendered_text)
+        self.assertNotIn("DO_NOT_EXPORT", rendered_text)
+        self.assertNotIn("const alsoUnrelated = true;", rendered_text)
+        self.assertNotIn("src/unused.ts", rendered_text)
 
     async def test_stage_endpoints_return_structural_pdfs_with_exact_filenames(self) -> None:
         performance = await download_performance_pdf(StagePdfRequest(report=report_for(Stage.PERFORMANCE)))

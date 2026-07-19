@@ -51,31 +51,39 @@ def _code_fence(content: str) -> str:
 
 
 def evidence_inventory_markdown(report: AgentReport) -> list[str]:
-    """Render every retained audit input so artifact readers can inspect the supplied evidence."""
+    """Render a concise, finding-linked evidence summary without exporting the repository."""
     inventory = report.evidence_inventory
     if inventory is None:
         return ["This legacy report has no retained evidence inventory.", ""]
     lines = [
-        "## Evidence appendix",
+        "## Evidence summary",
         "",
-        f"Source files reproduced: {len(inventory.source_files)}.",
-        f"Repository manifest paths reproduced: {len(inventory.repository_paths)}.",
+        f"Source files supplied to the audit: {len(inventory.source_files)}.",
+        f"Repository manifest paths supplied to the audit: {len(inventory.repository_paths)}.",
         (
             "Source coverage is complete."
             if inventory.source_content_complete
-            else "Source coverage is capped; the manifest is complete but only the reproduced source files were supplied for analysis."
+            else "Source coverage is capped; the manifest is complete but only the supplied source files were available for analysis."
         ),
-        "",
-        "### Repository manifest",
+        "Full repository source and the full manifest are retained for validation but are not embedded in this export.",
         "",
     ]
-    lines.extend(f"- `{path}`" for path in inventory.repository_paths)
-    lines.extend(["", "### Supplied source files", ""])
-    for source in inventory.source_files:
-        fence = _code_fence(source.content)
-        numbered = "\n".join(f"{line_number:06d} | {line}" for line_number, line in enumerate(source.content.splitlines(), start=1)) or "000001 | "
-        lines.extend([f"#### `{source.path}`", "", fence, numbered, fence, ""])
-    lines.extend(["### Runtime measurements", ""])
+
+    if report.findings:
+        lines.extend(["### Finding evidence and required changes", ""])
+        for finding in ordered_findings(report.findings):
+            lines.extend([f"#### {finding.title}", "", "**Cited evidence**", ""])
+            lines.extend(format_evidence_markdown(evidence) for evidence in finding.evidence)
+            lines.extend(["", "**Required change**", "", finding.remediation, ""])
+    else:
+        lines.extend(
+            [
+                "No evidence citation met the finding admission rule. No source excerpt or speculative fix is included.",
+                "",
+            ]
+        )
+
+    lines.extend(["### Runtime measurements supplied", ""])
     if inventory.runtime_measurements:
         for measurement in inventory.runtime_measurements:
             p95 = "null (no successful response latency was measured)" if measurement.p95_latency_ms is None else str(measurement.p95_latency_ms)

@@ -252,13 +252,6 @@ def _verbatim_evidence_block(text: str, styles: dict[str, ParagraphStyle]) -> Pr
     return Preformatted(text, styles["code"], maxLineLength=112)
 
 
-def _numbered_source(content: str) -> str:
-    lines = content.splitlines()
-    if not lines:
-        return "000001 | "
-    return "\n".join(f"{line_number:06d} | {line}" for line_number, line in enumerate(lines, start=1))
-
-
 def _evidence_inventory_flowables(report: AgentReport, styles: dict[str, ParagraphStyle], content_width: float) -> list[object]:
     inventory = report.evidence_inventory
     if inventory is None:
@@ -270,32 +263,42 @@ def _evidence_inventory_flowables(report: AgentReport, styles: dict[str, Paragra
         ]
 
     content: list[object] = [
-        _paragraph("Evidence appendix", styles["section"]),
+        _paragraph("Evidence summary", styles["section"]),
         _panel(
             [
-                _paragraph(f"Supplied source files reproduced below: {len(inventory.source_files)}.", styles["body"]),
-                _paragraph(f"Repository manifest paths reproduced below: {len(inventory.repository_paths)}.", styles["body"]),
+                _paragraph(f"Source files supplied to the audit: {len(inventory.source_files)}.", styles["body"]),
+                _paragraph(f"Repository manifest paths supplied to the audit: {len(inventory.repository_paths)}.", styles["body"]),
                 _paragraph(
-                    "Source coverage is complete." if inventory.source_content_complete else "Source coverage is capped; the manifest is complete but only the reproduced source files were supplied for analysis.",
+                    "Source coverage is complete." if inventory.source_content_complete else "Source coverage is capped; the manifest is complete but only the supplied source files were available for analysis.",
                     styles["body"],
                 ),
+                _paragraph("Full repository source and the full manifest are retained for validation but are not embedded in this export.", styles["body"]),
             ],
             content_width,
         ),
-        _paragraph("Repository manifest", styles["section"]),
-        _verbatim_evidence_block("\n".join(inventory.repository_paths) or "(no manifest paths supplied)", styles),
-        Spacer(1, 8),
-        _paragraph("Supplied source files", styles["section"]),
     ]
-    for source in inventory.source_files:
-        content.extend(
-            [
-                _paragraph(f"Source file: {source.path}", styles["finding"]),
-                _verbatim_evidence_block(_numbered_source(source.content), styles),
-                Spacer(1, 8),
-            ]
+    if report.findings:
+        content.append(_paragraph("Finding evidence and required changes", styles["section"]))
+        finding_summaries: list[object] = []
+        for finding in ordered_findings(report.findings):
+            finding_summaries.extend(
+                [
+                    _paragraph(finding.title, styles["finding"]),
+                    _paragraph("Cited evidence", styles["eyebrow"]),
+                    *[_paragraph(format_evidence_markdown(evidence), styles["muted"]) for evidence in finding.evidence],
+                    _paragraph("Required change", styles["eyebrow"]),
+                    _paragraph(finding.remediation, styles["body"]),
+                ]
+            )
+        content.append(_panel(finding_summaries, content_width))
+    else:
+        content.append(
+            _panel(
+                [_paragraph("No evidence citation met the finding admission rule. No source excerpt or speculative fix is included.", styles["body"])],
+                content_width,
+            )
         )
-    content.append(_paragraph("Runtime measurements", styles["section"]))
+    content.append(_paragraph("Runtime measurements supplied", styles["section"]))
     if inventory.runtime_measurements:
         for measurement in inventory.runtime_measurements:
             p95 = "null (no successful response latency was measured)" if measurement.p95_latency_ms is None else str(measurement.p95_latency_ms)
@@ -390,7 +393,7 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
                 _panel(
                     [
                         _paragraph("No evidence-backed findings were returned for the supplied evidence set.", styles["body"]),
-                        _paragraph("No code, configuration, security, or legal change is proposed without a verified finding. Review the complete evidence appendix before deciding whether additional evidence is required.", styles["body"]),
+                        _paragraph("No code, configuration, security, or legal change is proposed without a verified finding. Review the evidence summary and provide targeted additional evidence if needed.", styles["body"]),
                     ],
                     content_width,
                 ),
