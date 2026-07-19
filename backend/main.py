@@ -33,6 +33,7 @@ from scavibe.agents import (
     SpecialistAgent,
     selected_llm_provider,
 )
+from scavibe.agents.gateway import SECURITY_NVIDIA_NIM_MODEL
 from scavibe.contracts import (
     AgentReport,
     AuditContext,
@@ -444,16 +445,19 @@ async def get_audit(audit_id: str) -> AuditJob:
     return job
 
 
-def _configured_gateway() -> Gateway:
-    """Create the single explicitly configured specialist provider for this request."""
+def _configured_gateway(stage: Stage) -> Gateway:
+    """Create the explicit provider for one specialist stage."""
     provider = selected_llm_provider()
     if provider == "openai":
         return OpenAIGateway(OpenAISettings.from_environment())
+    nvidia_settings = NvidiaNimSettings.from_environment(
+        model_override=SECURITY_NVIDIA_NIM_MODEL if stage == Stage.SECURITY else None
+    )
     if provider == "nvidia":
-        return NvidiaNimGateway(NvidiaNimSettings.from_environment())
+        return NvidiaNimGateway(nvidia_settings)
     return AutoFallbackGateway(
         OpenAIGateway(OpenAISettings.from_environment()),
-        NvidiaNimGateway(NvidiaNimSettings.from_environment()),
+        NvidiaNimGateway(nvidia_settings),
     )
 
 
@@ -473,14 +477,15 @@ async def run_audit(audit_id: str, context: AuditContext) -> AuditRun:
         raise HTTPException(status_code=422, detail="context.repository_url must equal the repository_url used to create the audit")
     if _optional_url(context.app_url) != _optional_url(job.app_url):
         raise HTTPException(status_code=422, detail="context.app_url must equal the app_url used to create the audit")
-        try:
-            gateway = _configured_gateway()
-        except RuntimeError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
     try:
-        result = await AuditOrchestrator(gateway).run(context)
+        gateways = {stage: _configured_gateway(stage) for stage in Stage}
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    try:
+        result = await AuditOrchestrator(gateways).run(context)
     finally:
-        await gateway.aclose()
+        for gateway in gateways.values():
+            await gateway.aclose()
     job.status = "completed" if all(item.status != "failed" for item in result.stage_results) else "failed"
     return result
 
@@ -708,7 +713,7 @@ async def _analyze_specialist_with_gateway(stage: Stage, context: AuditContext, 
 
 async def _specialist_report(stage: Stage, context: AuditContext, *, on_phase=None) -> AgentReport:
     try:
-        gateway = _configured_gateway()
+        gateway = _configured_gateway(stage)
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     try:
@@ -985,7 +990,7 @@ async def audit_vercel_sandbox_security(
         if snapshot.context.commit_sha != sandbox.commit_sha:
             raise HTTPException(status_code=422, detail="signed audit pin commit does not match the signed sandbox commit")
         try:
-            gateway = _configured_gateway()
+            gateway = _configured_gateway(Stage.SECURITY)
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
         try:

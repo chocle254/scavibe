@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import httpx
 
+from main import _configured_gateway
+from scavibe.contracts import Stage
 from scavibe.agents.gateway import (
     AutoFallbackGateway,
     DEFAULT_NVIDIA_NIM_MODEL,
@@ -21,6 +23,7 @@ from scavibe.agents.gateway import (
     NvidiaNimSettings,
     OpenAIGateway,
     OpenAISettings,
+    SECURITY_NVIDIA_NIM_MODEL,
     selected_llm_provider,
 )
 
@@ -167,3 +170,22 @@ class OpenAIGatewayTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, environment, clear=True):
             with self.assertRaisesRegex(RuntimeError, "SCAVIBE_LLM_PROVIDER"):
                 selected_llm_provider()
+
+    async def test_security_uses_deepseek_v4_pro_for_nvidia_and_other_stages_keep_configured_model(self) -> None:
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "SCAVIBE_LLM_PROVIDER": "nvidia",
+                "NVIDIA_API_KEY": "test-nvidia-key",
+                "SCAVIBE_NVIDIA_MODEL": "nvidia/custom-legal-model",
+            }
+        )
+        with patch.dict(os.environ, environment, clear=True):
+            security = _configured_gateway(Stage.SECURITY)
+            legal = _configured_gateway(Stage.LEGAL)
+        try:
+            self.assertEqual(security.audit_engine_label, f"NVIDIA NIM ({SECURITY_NVIDIA_NIM_MODEL})")
+            self.assertEqual(legal.audit_engine_label, "NVIDIA NIM (nvidia/custom-legal-model)")
+        finally:
+            await security.aclose()
+            await legal.aclose()

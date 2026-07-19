@@ -30,7 +30,7 @@ Add these server-side variables to the Vercel project:
 | `SCAVIBE_LLM_PROVIDER` | Exactly `openai` (default), `nvidia`, or `auto`. `auto` tries OpenAI first on every specialist request and retries once with NVIDIA after an OpenAI gateway failure. |
 | `OPENAI_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=openai`; server-side key with access to `gpt-5.6-terra`. |
 | `NVIDIA_API_KEY` | Required only when `SCAVIBE_LLM_PROVIDER=nvidia`; server-side NVIDIA NIM key. NVIDIA output is labeled as NVIDIA NIM, not GPT-5.6. |
-| `SCAVIBE_NVIDIA_MODEL` | Optional only when `SCAVIBE_LLM_PROVIDER=nvidia`; default `nvidia/llama-3.3-nemotron-super-49b-v1.5`. |
+| `SCAVIBE_NVIDIA_MODEL` | Optional for non-Security NVIDIA calls; default `nvidia/llama-3.3-nemotron-super-49b-v1.5`. Security always uses `deepseek-ai/deepseek-v4-pro`, the verified free NVIDIA API endpoint. |
 | `SCAVIBE_ALLOWED_ORIGINS` | The exact Vercel preview origin, such as `https://scavibe-git-main-team.vercel.app`. |
 | `GITHUB_TOKEN` | Required for private-repository intake and for user-approved draft PR creation. Public repository intake works without it, subject to GitHub's unauthenticated API limit. |
 | `BLOB_READ_WRITE_TOKEN` | Not required for the current agent backbone. |

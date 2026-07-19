@@ -137,6 +137,10 @@ NVIDIA NIM's Chat Completions API instead. It is a fallback for a credit-limited
 deployment, not GPT-5.6 output. Every specialist report and PDF identifies the
 exact analysis engine that produced it.
 
+For Security, NVIDIA mode and auto fallback use the verified free NVIDIA API
+endpoint `deepseek-ai/deepseek-v4-pro`. Other NVIDIA specialist calls use
+`SCAVIBE_NVIDIA_MODEL`, or its documented default when that variable is absent.
+
 `SCAVIBE_LLM_PROVIDER=auto` tries OpenAI first for every specialist request and
 retries once with NVIDIA only after an OpenAI gateway failure (HTTP failure,
 timeout, invalid API response, or empty API response). It requires both keys.
@@ -188,7 +192,7 @@ OPENAI_API_KEY=your_openai_project_key
 # NVIDIA fallback example:
 # SCAVIBE_LLM_PROVIDER=nvidia
 # NVIDIA_API_KEY=your_nvidia_nim_key
-# SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5
+# SCAVIBE_NVIDIA_MODEL=nvidia/llama-3.3-nemotron-super-49b-v1.5  # non-Security NVIDIA calls
 # Automatic recovery, requiring both keys:
 # SCAVIBE_LLM_PROVIDER=auto
 GITHUB_TOKEN=ghp_...

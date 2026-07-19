@@ -33,6 +33,7 @@ NVIDIA_NIM_CHAT_COMPLETIONS_URL = "https://integrate.api.nvidia.com/v1/chat/comp
 # at the Chat Completions endpoint. Deployments can pin another NIM model with
 # SCAVIBE_NVIDIA_MODEL.
 DEFAULT_NVIDIA_NIM_MODEL = "nvidia/llama-3.3-nemotron-super-49b-v1.5"
+SECURITY_NVIDIA_NIM_MODEL = "deepseek-ai/deepseek-v4-pro"
 MAX_NVIDIA_NIM_OUTPUT_TOKENS = 2048
 LOGGER = logging.getLogger("scavibe.agents.gateway")
 
@@ -59,9 +60,9 @@ class NvidiaNimSettings:
     model: str
 
     @classmethod
-    def from_environment(cls) -> "NvidiaNimSettings":
+    def from_environment(cls, *, model_override: str | None = None) -> "NvidiaNimSettings":
         api_key = os.environ.get("NVIDIA_API_KEY", "").strip()
-        model = os.environ.get("SCAVIBE_NVIDIA_MODEL", DEFAULT_NVIDIA_NIM_MODEL).strip()
+        model = (model_override or os.environ.get("SCAVIBE_NVIDIA_MODEL", DEFAULT_NVIDIA_NIM_MODEL)).strip()
         if not api_key:
             raise RuntimeError("NVIDIA_API_KEY is required when SCAVIBE_LLM_PROVIDER=nvidia")
         if not model:

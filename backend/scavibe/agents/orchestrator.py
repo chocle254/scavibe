@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from ..contracts import AgentReport, AuditContext, AuditRun, EvidenceInventory, Stage, StageResult
 from .base import SpecialistAgent
 from .gateway import AgentProtocolError, Gateway
@@ -14,18 +16,19 @@ from .thresholds import PERFORMANCE_MIN_CONCURRENT_USERS, PERFORMANCE_MIN_DURATI
 class AuditOrchestrator:
     """Runs performance, security, then legal; an invalid response halts later stages."""
 
-    def __init__(self, gateway: Gateway) -> None:
+    def __init__(self, gateway: Gateway | Mapping[Stage, Gateway]) -> None:
+        gateways = gateway if isinstance(gateway, Mapping) else {stage: gateway for stage in Stage}
         self._agents = {
-            Stage.PERFORMANCE: SpecialistAgent(Stage.PERFORMANCE, gateway, system_prompt=PERFORMANCE_PROMPT, stage_validator=validate_performance_finding),
+            Stage.PERFORMANCE: SpecialistAgent(Stage.PERFORMANCE, gateways[Stage.PERFORMANCE], system_prompt=PERFORMANCE_PROMPT, stage_validator=validate_performance_finding),
             Stage.SECURITY: SpecialistAgent(
                 Stage.SECURITY,
-                gateway,
+                gateways[Stage.SECURITY],
                 system_prompt=SECURITY_PROMPT,
                 stage_validator=validate_security_finding,
                 context_preparer=prepare_security_context,
                 include_runtime_measurements=False,
             ),
-            Stage.LEGAL: SpecialistAgent(Stage.LEGAL, gateway, system_prompt=LEGAL_PROMPT, stage_validator=validate_legal_finding, required_limitation=LEGAL_DISCLAIMER),
+            Stage.LEGAL: SpecialistAgent(Stage.LEGAL, gateways[Stage.LEGAL], system_prompt=LEGAL_PROMPT, stage_validator=validate_legal_finding, required_limitation=LEGAL_DISCLAIMER),
         }
 
     async def run(self, context: AuditContext) -> AuditRun:
