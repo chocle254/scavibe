@@ -17,6 +17,28 @@ Scavibe automates the audit. Paste your GitHub repo and deployed app URL, and th
 
 ---
 
+## Built with Codex + GPT-5.6
+
+Scavibe was built with Codex as the engineering collaborator. Codex accelerated
+the Next.js and FastAPI implementation, typed audit contracts, Server-Sent
+Events progress interface, sandbox load-test guardrails, PDF reports, and the
+unit-test suite that verifies the audit rules.
+
+GPT-5.6 Terra (`gpt-5.6-terra`) is Scavibe's primary specialist-analysis model
+through OpenAI's Responses API. It receives the pinned repository snapshot and
+returns structured candidate findings for the Performance, Security, and
+Data-handling stages. The model does not decide whether a finding is accepted:
+the backend verifies every cited source location and quote, calculates
+severity and confidence deterministically, enforces the measured performance
+thresholds, and blocks unsafe proof-of-concept requests.
+
+When OpenAI is unavailable or rate-limited, the deployment can use an
+explicitly labeled NVIDIA NIM fallback. Reports identify the analysis engine
+that actually produced each stage, so NVIDIA output is never represented as
+GPT-5.6 output.
+
+---
+
 ## How It Works
 
 ```
@@ -236,4 +258,12 @@ traffic to a production URL by default.
 
 ## Built With
 
-Codex + GPT-5.6, used across all three agent stages for code understanding, security analysis, and document generation.
+- **Codex** - implementation partner for the full-stack product, live audit
+  workflow, validation logic, test coverage, and iterative debugging.
+- **GPT-5.6 Terra** - primary structured-analysis model for Performance,
+  Security, and Data-handling candidate findings.
+- **Deterministic backend controls** - source-evidence validation, scoring,
+  performance thresholds, sandbox targeting, and proof-of-concept safety are
+  enforced in code rather than delegated to a model.
+- **NVIDIA NIM** - explicitly labeled fallback provider when OpenAI is
+  unavailable; it is not represented as GPT-5.6 in reports.

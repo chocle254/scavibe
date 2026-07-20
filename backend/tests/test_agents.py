@@ -151,9 +151,11 @@ class QuoteMismatchThenRepairGateway:
 
     def __init__(self) -> None:
         self.prompts: list[str] = []
+        self.inputs: list[dict] = []
 
     async def generate(self, *, system_prompt: str, input_json: str) -> str:
         self.prompts.append(system_prompt)
+        self.inputs.append(json.loads(input_json))
         if len(self.prompts) == 1:
             return json.dumps(
                 {
@@ -292,6 +294,14 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         repair = gateway.prompts[1]
         self.assertIn("evidence quote does not match cited lines: api/users.py", repair)
         self.assertIn("Copy the quote byte-for-byte", repair)
+        self.assertIn('"citation_repair_context"', repair)
+        self.assertNotIn("AUTHORITATIVE SOURCE EXCERPT", repair)
+        repair_context = gateway.inputs[1]["citation_repair_context"]
+        self.assertIn("AUTHORITATIVE SOURCE EXCERPT: api/users.py lines 3-3", repair_context)
+        self.assertIn(
+            "query = \"SELECT * FROM users WHERE id = '\" + user_id + \"'\"",
+            repair_context,
+        )
         self.assertNotIn("SELECT * FROM users WHERE id = request_id", repair)
 
     async def test_security_near_miss_schema_receives_exact_repair_and_returns_valid_draft(self) -> None:
