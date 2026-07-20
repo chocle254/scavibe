@@ -247,7 +247,7 @@ class SpecialistAgent:
             agent_context,
             include_runtime_measurements=self._include_runtime_measurements,
         )
-        draft: AgentDraft | None = None
+        report: AgentReport | None = None
         format_error: str | None = None
         if on_phase is not None:
             await on_phase("phase_started", "specialist_analysis")
@@ -261,17 +261,26 @@ class SpecialistAgent:
                 if missing_fields:
                     raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
                 draft = AgentDraft.model_validate(candidate)
+                # Treat source-line verification and stage-policy validation as part of
+                # admitting a model response. An invalid citation is never accepted or
+                # rewritten; the model receives one exact repair opportunity instead.
+                report = validate_draft(
+                    self._stage,
+                    draft,
+                    context,
+                    self._stage_validator,
+                    self._required_limitation,
+                )
                 break
             except (AgentProtocolError, ValidationError) as error:
                 format_error = _agent_draft_error_summary(error)
-        if draft is None:
+        if report is None:
             raise AgentProtocolError(
-                f"{self._stage} response failed AgentDraft format validation after {MAX_AGENT_FORMAT_ATTEMPTS} attempts: {format_error}"
+                f"{self._stage} response failed AgentDraft or evidence validation after {MAX_AGENT_FORMAT_ATTEMPTS} attempts: {format_error}"
             )
         if on_phase is not None:
             await on_phase("phase_completed", "specialist_analysis")
             await on_phase("phase_started", "evidence_validation")
-        report = validate_draft(self._stage, draft, context, self._stage_validator, self._required_limitation)
         if omitted_file_count:
             report.limitations.append(
                 f"Specialist input contained {len(agent_context.source_files)} of {len(context.source_files)} source files, capped at {MAX_AGENT_INPUT_JSON_CHARACTERS} serialized JSON characters; repository-wide absence claims are invalid."
@@ -308,6 +317,6 @@ Every finding requires "title", "statement", "impact", "attacker_access", "evide
 Use impact only from: "none", "single_user_data", "multi_user_data", "all_user_data", "credential_compromise", "arbitrary_code_execution", "service_unavailable".
 Use attacker_access only from: "local", "authenticated_low_privilege", "unauthenticated_remote".
 Every source-evidence object requires "kind": "source", "statement", "file_path", "start_line", "end_line", and "quote". Do not use "type" in place of "kind".
-For the security stage, evidence kind must be "source" and every quote must exactly match the cited repository line range.
+For the security stage, evidence kind must be "source" and every quote must exactly match the cited repository line range. Copy the quote byte-for-byte from the inclusive supplied lines: do not paraphrase it or quote nearby lines. If you cannot provide an exact quote, omit that finding and record a limitation instead.
 The previous response failed these contract checks: {error_summary or "unknown contract error"}.
 """

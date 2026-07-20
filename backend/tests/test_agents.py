@@ -146,6 +146,44 @@ class InvalidQuoteGateway:
         )
 
 
+class QuoteMismatchThenRepairGateway:
+    """Returns a schema-valid but source-invalid citation, then a valid repair."""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def generate(self, *, system_prompt: str, input_json: str) -> str:
+        self.prompts.append(system_prompt)
+        if len(self.prompts) == 1:
+            return json.dumps(
+                {
+                    "stage": "security",
+                    "summary": "The supplied source contains a request-derived SQL construction path.",
+                    "findings": [
+                        {
+                            "title": "Request input is concatenated into SQL",
+                            "statement": "api/users.py line 3 constructs a SQL query from request-derived input.",
+                            "impact": "multi_user_data",
+                            "attacker_access": "unauthenticated_remote",
+                            "evidence": [
+                                {
+                                    "kind": "source",
+                                    "statement": "The query construction line uses request-derived user_id.",
+                                    "file_path": "api/users.py",
+                                    "start_line": 3,
+                                    "end_line": 3,
+                                    "quote": "SELECT * FROM users WHERE id = request_id",
+                                }
+                            ],
+                            "remediation": "Replace the concatenated query at api/users.py line 3 with a parameterized query.",
+                        }
+                    ],
+                    "limitations": [],
+                }
+            )
+        return await FakeGateway().generate(system_prompt=system_prompt, input_json=input_json)
+
+
 class NearMissDeepSeekGateway:
     """Reproduces the alternate JSON keys returned by the NVIDIA security fallback."""
 
@@ -243,6 +281,18 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_quote_is_rejected(self) -> None:
         with self.assertRaises(AgentProtocolError):
             await SpecialistAgent(Stage.SECURITY, InvalidQuoteGateway()).analyze(context())
+
+    async def test_security_invalid_evidence_quote_receives_repair_before_report_is_admitted(self) -> None:
+        gateway = QuoteMismatchThenRepairGateway()
+
+        report = await SpecialistAgent(Stage.SECURITY, gateway).analyze(context())
+
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(len(gateway.prompts), 2)
+        repair = gateway.prompts[1]
+        self.assertIn("evidence quote does not match cited lines: api/users.py", repair)
+        self.assertIn("Copy the quote byte-for-byte", repair)
+        self.assertNotIn("SELECT * FROM users WHERE id = request_id", repair)
 
     async def test_security_near_miss_schema_receives_exact_repair_and_returns_valid_draft(self) -> None:
         gateway = NearMissDeepSeekGateway()
