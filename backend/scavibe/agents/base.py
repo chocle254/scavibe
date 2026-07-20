@@ -247,15 +247,12 @@ class SpecialistAgent:
             agent_context,
             include_runtime_measurements=self._include_runtime_measurements,
         )
-        payload: dict | None = None
-        format_error: AgentProtocolError | None = None
+        draft: AgentDraft | None = None
+        format_error: str | None = None
         if on_phase is not None:
             await on_phase("phase_started", "specialist_analysis")
         for attempt in range(MAX_AGENT_FORMAT_ATTEMPTS):
-            repair_instruction = "" if attempt == 0 else (
-                "\nFORMAT REPAIR: Your prior response was rejected because it was not one complete AgentDraft JSON object. "
-                "Return one JSON object only, with no Markdown fence, prose, or second JSON value."
-            )
+            repair_instruction = "" if attempt == 0 else _agent_draft_repair_instruction(self._stage, format_error)
             raw_output = await self._gateway.generate(system_prompt=f"{self._system_prompt}{repair_instruction}", input_json=input_json)
             try:
                 candidate = _parse_agent_json(raw_output, self._stage)
@@ -263,18 +260,14 @@ class SpecialistAgent:
                 missing_fields = [field for field in required_fields if field not in candidate]
                 if missing_fields:
                     raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
-                payload = candidate
+                draft = AgentDraft.model_validate(candidate)
                 break
-            except AgentProtocolError as error:
-                format_error = error
-        if payload is None:
+            except (AgentProtocolError, ValidationError) as error:
+                format_error = _agent_draft_error_summary(error)
+        if draft is None:
             raise AgentProtocolError(
                 f"{self._stage} response failed AgentDraft format validation after {MAX_AGENT_FORMAT_ATTEMPTS} attempts: {format_error}"
             )
-        try:
-            draft = AgentDraft.model_validate(payload)
-        except ValidationError as error:
-            raise AgentProtocolError(f"{self._stage} response is not a valid AgentDraft: {error}") from error
         if on_phase is not None:
             await on_phase("phase_completed", "specialist_analysis")
             await on_phase("phase_started", "evidence_validation")
@@ -286,3 +279,35 @@ class SpecialistAgent:
         if on_phase is not None:
             await on_phase("phase_completed", "evidence_validation")
         return report
+
+
+MAX_AGENT_REPAIR_ERROR_ITEMS = 12
+
+
+def _agent_draft_error_summary(error: AgentProtocolError | ValidationError) -> str:
+    """Return schema paths and messages only; never echo model-supplied source text back into a repair prompt."""
+    if isinstance(error, AgentProtocolError):
+        return str(error)
+    items = error.errors()
+    summaries = [
+        f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+        for item in items[:MAX_AGENT_REPAIR_ERROR_ITEMS]
+    ]
+    if len(items) > MAX_AGENT_REPAIR_ERROR_ITEMS:
+        summaries.append(f"{len(items) - MAX_AGENT_REPAIR_ERROR_ITEMS} additional validation errors were omitted.")
+    return "; ".join(summaries)
+
+
+def _agent_draft_repair_instruction(stage: Stage, error_summary: str | None) -> str:
+    """State the exact JSON contract after a model returns a near-miss schema."""
+    return f"""
+FORMAT REPAIR: Return exactly one JSON object and no Markdown fence, prose, or second JSON value.
+The top-level object requires exactly these fields: "stage", "summary", "findings", "limitations".
+Set "stage" to "{stage.value}". "summary" is a string. "limitations" is an array of strings, never objects.
+Every finding requires "title", "statement", "impact", "attacker_access", "evidence", and "remediation".
+Use impact only from: "none", "single_user_data", "multi_user_data", "all_user_data", "credential_compromise", "arbitrary_code_execution", "service_unavailable".
+Use attacker_access only from: "local", "authenticated_low_privilege", "unauthenticated_remote".
+Every source-evidence object requires "kind": "source", "statement", "file_path", "start_line", "end_line", and "quote". Do not use "type" in place of "kind".
+For the security stage, evidence kind must be "source" and every quote must exactly match the cited repository line range.
+The previous response failed these contract checks: {error_summary or "unknown contract error"}.
+"""

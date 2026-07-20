@@ -146,6 +146,42 @@ class InvalidQuoteGateway:
         )
 
 
+class NearMissDeepSeekGateway:
+    """Reproduces the alternate JSON keys returned by the NVIDIA security fallback."""
+
+    def __init__(self) -> None:
+        self.prompts: list[str] = []
+
+    async def generate(self, *, system_prompt: str, input_json: str) -> str:
+        self.prompts.append(system_prompt)
+        if len(self.prompts) == 1:
+            return json.dumps(
+                {
+                    "stage": "security",
+                    "summary": "The supplied route needs a source-evidenced security review.",
+                    "findings": [
+                        {
+                            "statement": "api/users.py line 3 constructs SQL from request-derived user_id.",
+                            "impact": "privilege_escalation",
+                            "attacker_access": "unauthenticated_remote",
+                            "evidence": [
+                                {
+                                    "type": "source",
+                                    "file_path": "api/users.py",
+                                    "start_line": 3,
+                                    "end_line": 3,
+                                    "quote": "MODEL_SOURCE_SENTINEL",
+                                }
+                            ],
+                            "remediation": "Use a parameterized query and test a quoted identifier.",
+                        }
+                    ],
+                    "limitations": [{"category": "source_coverage", "detail": "No absence claim is made."}],
+                }
+            )
+        return await FakeGateway().generate(system_prompt=system_prompt, input_json=input_json)
+
+
 class CapturingSecurityGateway(FakeGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -207,6 +243,21 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_quote_is_rejected(self) -> None:
         with self.assertRaises(AgentProtocolError):
             await SpecialistAgent(Stage.SECURITY, InvalidQuoteGateway()).analyze(context())
+
+    async def test_security_near_miss_schema_receives_exact_repair_and_returns_valid_draft(self) -> None:
+        gateway = NearMissDeepSeekGateway()
+
+        report = await SpecialistAgent(Stage.SECURITY, gateway).analyze(context())
+
+        self.assertEqual(len(report.findings), 1)
+        self.assertEqual(len(gateway.prompts), 2)
+        repair = gateway.prompts[1]
+        self.assertIn("FORMAT REPAIR", repair)
+        self.assertIn('"title"', repair)
+        self.assertIn('"kind": "source"', repair)
+        self.assertIn("limitations\" is an array of strings", repair)
+        self.assertIn('never use "privilege_escalation"', repair)
+        self.assertNotIn("MODEL_SOURCE_SENTINEL", repair)
 
     async def test_pipeline_runs_verified_stages_in_order(self) -> None:
         result = await AuditOrchestrator(FakeGateway()).run(context())

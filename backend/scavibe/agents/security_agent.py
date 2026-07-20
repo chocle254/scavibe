@@ -30,6 +30,14 @@ finding must describe a verified exploit path, not a suspicious pattern.
 {COMMON_RULES}
 
 Stage must be "security". Every security finding requires source evidence.
+Return the exact AgentDraft JSON field names. Each finding must include
+"title", "statement", "impact", "attacker_access", "evidence", and
+"remediation". Use impact only from "single_user_data", "multi_user_data",
+"all_user_data", "credential_compromise", "arbitrary_code_execution", or
+"service_unavailable"; never use "privilege_escalation". Each evidence item
+must include "kind": "source", "statement", "file_path", "start_line",
+"end_line", and "quote". Do not use "type" instead of "kind". Limitations
+must be an array of strings, never category/detail objects.
 Identify a vulnerability only when the cited lines establish both: (1) a
 security-relevant source, such as request input, identity, authorization state,
 or secret; and (2) a dangerous sink or missing server-side control. A raw SQL
