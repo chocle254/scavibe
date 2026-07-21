@@ -740,6 +740,20 @@ details ul { margin: 8px 0 0; padding-left: 17px; }
 details li { overflow-wrap: anywhere; }
 .no-findings { display: flex; align-items: center; gap: 7px; color: #bed0c4; font-size: 10px; }
 .no-findings svg { width: 15px; height: 15px; color: var(--lime); }
+.citation-exclusions {
+  margin-top: 14px;
+  border: 1px solid rgba(255, 183, 104, .3);
+  border-radius: 9px;
+  background: rgba(255, 183, 104, .06);
+  padding: 10px 12px;
+  color: #d6c9b5;
+  font-size: 10px;
+  line-height: 1.55;
+}
+.citation-exclusions summary { cursor: pointer; color: #ffce73; font: 10px 'DM Mono', monospace; text-transform: uppercase; }
+.citation-exclusions p { margin: 8px 0; }
+.citation-exclusions ul { margin: 0; padding-left: 18px; }
+.citation-exclusions h2 { margin: 6px 0 0; color: #fff0d3; font-size: 16px; letter-spacing: -.5px; }
 .evidence-panel {
   display: grid;
   min-width: 0;

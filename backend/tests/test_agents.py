@@ -117,30 +117,56 @@ class FakeGateway:
 
 
 class InvalidQuoteGateway:
+    def __init__(self, stage: Stage = Stage.SECURITY, *, include_valid_finding: bool = False) -> None:
+        self._stage = stage
+        self._include_valid_finding = include_valid_finding
+
     async def generate(self, *, system_prompt: str, input_json: str) -> str:
-        return json.dumps(
+        findings = [
             {
-                "stage": "security",
-                "summary": "A claim with invalid evidence.",
-                "findings": [
+                "title": "Invalid finding must be rejected",
+                "statement": "This has an unsupported quote.",
+                "impact": "single_user_data",
+                "attacker_access": "authenticated_low_privilege",
+                "evidence": [
                     {
-                        "title": "Invalid finding must be rejected",
-                        "statement": "This has an unsupported quote.",
-                        "impact": "single_user_data",
-                        "attacker_access": "authenticated_low_privilege",
-                        "evidence": [
-                            {
-                                "kind": "source",
-                                "statement": "This quote is not present in the source.",
-                                "file_path": "api/users.py",
-                                "start_line": 3,
-                                "end_line": 3,
-                                "quote": "not-present",
-                            }
-                        ],
-                        "remediation": "Use a source quote that exists in the cited line range.",
+                        "kind": "source",
+                        "statement": "This quote is not present in the source.",
+                        "file_path": "api/users.py",
+                        "start_line": 3,
+                        "end_line": 3,
+                        "quote": "not-present",
                     }
                 ],
+                "remediation": "Use a source quote that exists in the cited line range.",
+            }
+        ]
+        if self._include_valid_finding:
+            findings.insert(
+                0,
+                {
+                    "title": "Verified request-derived SQL construction",
+                    "statement": "api/users.py line 3 constructs a SQL command from request-derived user_id.",
+                    "impact": "single_user_data",
+                    "attacker_access": "authenticated_low_privilege",
+                    "evidence": [
+                        {
+                            "kind": "source",
+                            "statement": "The query is concatenated from request-derived user_id.",
+                            "file_path": "api/users.py",
+                            "start_line": 3,
+                            "end_line": 3,
+                            "quote": "query = \"SELECT * FROM users WHERE id = '\" + user_id + \"'\"",
+                        }
+                    ],
+                    "remediation": "Replace the concatenated query at api/users.py line 3 with a parameterized query.",
+                },
+            )
+        return json.dumps(
+            {
+                "stage": self._stage.value,
+                "summary": "A claim with invalid evidence.",
+                "findings": findings,
                 "limitations": [],
             }
         )
@@ -280,9 +306,20 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    async def test_invalid_quote_is_rejected(self) -> None:
-        with self.assertRaises(AgentProtocolError):
-            await SpecialistAgent(Stage.SECURITY, InvalidQuoteGateway()).analyze(context())
+    async def test_security_and_legal_complete_with_mismatched_quotes_explicitly_excluded(self) -> None:
+        for stage in (Stage.SECURITY, Stage.LEGAL):
+            with self.subTest(stage=stage):
+                report = await SpecialistAgent(stage, InvalidQuoteGateway(stage, include_valid_finding=True)).analyze(context())
+
+                self.assertEqual(len(report.findings), 1)
+                self.assertEqual(report.findings[0].title, "Verified request-derived SQL construction")
+                self.assertEqual(len(report.citation_exclusions), 1)
+                exclusion = report.citation_exclusions[0]
+                self.assertEqual(exclusion.file_path, "api/users.py")
+                self.assertEqual(exclusion.start_line, 3)
+                self.assertEqual(exclusion.end_line, 3)
+                self.assertEqual(exclusion.reason, "quote_does_not_match_cited_lines")
+                self.assertIn("related findings are not included", report.limitations[-1])
 
     async def test_security_invalid_evidence_quote_receives_repair_before_report_is_admitted(self) -> None:
         gateway = QuoteMismatchThenRepairGateway()
@@ -408,6 +445,16 @@ class StageValidatorPolicyTests(unittest.TestCase):
             validate_draft(
                 Stage.SECURITY,
                 draft("security", "none", "unauthenticated_remote", source_evidence()),
+                context(),
+                validate_security_finding,
+            )
+
+    def test_strict_validator_rejects_a_mismatched_source_quote(self) -> None:
+        bad_evidence = source_evidence() | {"quote": "not-present"}
+        with self.assertRaises(AgentProtocolError):
+            validate_draft(
+                Stage.SECURITY,
+                draft("security", "single_user_data", "unauthenticated_remote", bad_evidence),
                 context(),
                 validate_security_finding,
             )

@@ -8,7 +8,7 @@ from typing import Literal
 
 from pydantic import ValidationError
 
-from ..contracts import AgentDraft, AgentReport, AuditContext, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, ProposedFinding, Stage
+from ..contracts import AgentDraft, AgentReport, AuditContext, CitationExclusion, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, ProposedFinding, Stage
 from ..scoring import confidence_score, risk_score, severity_for
 from .gateway import AgentProtocolError, Gateway
 
@@ -173,20 +173,90 @@ def validate_draft(
         raise AgentProtocolError(f"agent returned stage {draft.stage}, expected {stage}")
     findings: list[Finding] = []
     for proposed in draft.findings:
-        for item in proposed.evidence:
-            _validate_evidence(item, context)
+        findings.append(_validate_and_score_finding(stage, proposed, context, stage_validator))
+    return _report_from_validated_findings(stage, draft, context, findings, required_limitation)
+
+
+def validate_draft_excluding_mismatched_quotes(
+    stage: Stage,
+    draft: AgentDraft,
+    context: AuditContext,
+    stage_validator: StageValidator,
+    required_limitation: str | None = None,
+) -> AgentReport:
+    """Keep verified findings while explicitly excluding candidates with bad source quotes.
+
+    This function is used only after the fixed two-attempt repair loop ends with
+    an exact source-quote mismatch. It never admits a rejected citation or its
+    finding, and it still raises every non-quote validation or policy error.
+    """
+    if draft.stage != stage:
+        raise AgentProtocolError(f"agent returned stage {draft.stage}, expected {stage}")
+    findings: list[Finding] = []
+    exclusions: list[CitationExclusion] = []
+    for proposed in draft.findings:
         stage_validator(proposed, context)
-        values = proposed.model_dump()
-        if stage == Stage.SECURITY:
-            values["exploitability_status"] = ExploitabilityStatus.CANDIDATE_UNCONFIRMED
-        findings.append(
-            Finding(
-                **values,
-                risk_score=risk_score(proposed.impact, proposed.attacker_access),
-                severity=severity_for(risk_score(proposed.impact, proposed.attacker_access)),
-                confidence_score=confidence_score(proposed.evidence),
-            )
+        proposed_exclusions: list[CitationExclusion] = []
+        for item in proposed.evidence:
+            try:
+                _validate_evidence(item, context)
+            except AgentProtocolError as error:
+                if item.kind != EvidenceKind.SOURCE or not str(error).startswith("evidence quote does not match cited lines:"):
+                    raise
+                if item.file_path is None or item.start_line is None or item.end_line is None:
+                    raise AgentProtocolError("source quote mismatch did not contain a complete source location") from error
+                proposed_exclusions.append(
+                    CitationExclusion(
+                        file_path=item.file_path,
+                        start_line=item.start_line,
+                        end_line=item.end_line,
+                        reason="quote_does_not_match_cited_lines",
+                    )
+                )
+        if proposed_exclusions:
+            exclusions.extend(proposed_exclusions)
+            continue
+        findings.append(_score_finding(stage, proposed))
+    report = _report_from_validated_findings(stage, draft, context, findings, required_limitation)
+    report.citation_exclusions = exclusions
+    if exclusions:
+        report.limitations.append(
+            f"{len(exclusions)} model-proposed source citation(s) were excluded because their quotes did not match the pinned file and line range. Their related findings are not included in this report."
         )
+    return report
+
+
+def _validate_and_score_finding(
+    stage: Stage,
+    proposed: ProposedFinding,
+    context: AuditContext,
+    stage_validator: StageValidator,
+) -> Finding:
+    for item in proposed.evidence:
+        _validate_evidence(item, context)
+    stage_validator(proposed, context)
+    return _score_finding(stage, proposed)
+
+
+def _score_finding(stage: Stage, proposed: ProposedFinding) -> Finding:
+    values = proposed.model_dump()
+    if stage == Stage.SECURITY:
+        values["exploitability_status"] = ExploitabilityStatus.CANDIDATE_UNCONFIRMED
+    return Finding(
+        **values,
+        risk_score=risk_score(proposed.impact, proposed.attacker_access),
+        severity=severity_for(risk_score(proposed.impact, proposed.attacker_access)),
+        confidence_score=confidence_score(proposed.evidence),
+    )
+
+
+def _report_from_validated_findings(
+    stage: Stage,
+    draft: AgentDraft,
+    context: AuditContext,
+    findings: list[Finding],
+    required_limitation: str | None,
+) -> AgentReport:
     limitations = list(draft.limitations)
     if required_limitation and required_limitation not in limitations:
         limitations.append(required_limitation)
@@ -251,6 +321,7 @@ class SpecialistAgent:
         report: AgentReport | None = None
         format_error: str | None = None
         citation_repair_context: str | None = None
+        final_draft: AgentDraft | None = None
         if on_phase is not None:
             await on_phase("phase_started", "specialist_analysis")
         for attempt in range(MAX_AGENT_FORMAT_ATTEMPTS):
@@ -261,6 +332,7 @@ class SpecialistAgent:
                 input_json=request_input_json,
             )
             draft: AgentDraft | None = None
+            final_draft = None
             try:
                 candidate = _parse_agent_json(raw_output, self._stage)
                 required_fields = ("stage", "summary", "findings", "limitations")
@@ -268,6 +340,7 @@ class SpecialistAgent:
                 if missing_fields:
                     raise AgentProtocolError(f"{self._stage} response is missing required AgentDraft fields: {', '.join(missing_fields)}")
                 draft = AgentDraft.model_validate(candidate)
+                final_draft = draft
                 # Treat source-line verification and stage-policy validation as part of
                 # admitting a model response. An invalid citation is never accepted or
                 # rewritten; the model receives one exact repair opportunity instead.
@@ -284,6 +357,19 @@ class SpecialistAgent:
                 citation_repair_context = (
                     _citation_repair_context(draft, context) if draft is not None else None
                 )
+        if (
+            report is None
+            and final_draft is not None
+            and format_error is not None
+            and "evidence quote does not match cited lines:" in format_error
+        ):
+            report = validate_draft_excluding_mismatched_quotes(
+                self._stage,
+                final_draft,
+                context,
+                self._stage_validator,
+                self._required_limitation,
+            )
         if report is None:
             raise AgentProtocolError(
                 f"{self._stage} response failed AgentDraft or evidence validation after {MAX_AGENT_FORMAT_ATTEMPTS} attempts: {format_error}"

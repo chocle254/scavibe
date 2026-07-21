@@ -169,6 +169,20 @@ def report_markdown(report: AgentReport) -> str:
         lines.append("No remediation is proposed because no finding met the evidence admission rule. Do not apply a speculative fix from this report.")
     lines.extend(["## Limitations", ""])
     lines.extend(f"- {limitation}" for limitation in report.limitations)
+    if report.citation_exclusions:
+        lines.extend(
+            [
+                "",
+                f"## Excluded source citations ({len(report.citation_exclusions)})",
+                "",
+                "These model-proposed citations failed exact quote validation. They are not evidence, were not scored, and their related findings are excluded from this report.",
+                "",
+            ]
+        )
+        lines.extend(
+            f"- `{item.file_path}` lines {item.start_line}-{item.end_line}: quote does not match the pinned source lines."
+            for item in report.citation_exclusions
+        )
     lines.extend(["", f"Evidence commit: `{report.evidence_commit_sha}`", ""])
     lines.extend(evidence_inventory_markdown(report))
     return "\n".join(lines)

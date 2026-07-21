@@ -417,6 +417,26 @@ def generate_pdf_report(report: AgentReport, stage_color: str, stage_label: str)
     story.append(_paragraph("Limitations", styles["section"]))
     limitation_lines = [_paragraph(f"• {limitation}", styles["body"]) for limitation in report.limitations]
     story.append(_panel(limitation_lines, content_width))
+    if report.citation_exclusions:
+        exclusion_lines: list[object] = [
+            _paragraph(
+                "These model-proposed citations failed exact quote validation. They are not evidence, were not scored, and their related findings are excluded from this report.",
+                styles["body"],
+            )
+        ]
+        exclusion_lines.extend(
+            _paragraph(
+                f"{item.file_path} lines {item.start_line}-{item.end_line}: quote does not match the pinned source lines.",
+                styles["muted"],
+            )
+            for item in report.citation_exclusions
+        )
+        story.extend(
+            [
+                _paragraph(f"Excluded source citations ({len(report.citation_exclusions)})", styles["section"]),
+                _panel(exclusion_lines, content_width),
+            ]
+        )
     story.extend(_evidence_inventory_flowables(report, styles, content_width))
     document.build(story, onFirstPage=_draw_page(accent), onLaterPages=_draw_page(accent))
     return buffer.getvalue()

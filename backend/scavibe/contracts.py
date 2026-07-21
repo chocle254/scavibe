@@ -199,6 +199,15 @@ class Finding(ProposedFinding):
     poc_execution: SecurityPocExecution | None = None
 
 
+class CitationExclusion(BaseModel):
+    """A model-proposed source citation that did not meet the evidence admission rule."""
+
+    file_path: Annotated[str, Field(min_length=1, max_length=500)]
+    start_line: Annotated[int, Field(ge=1)]
+    end_line: Annotated[int, Field(ge=1)]
+    reason: Literal["quote_does_not_match_cited_lines"]
+
+
 class RampAssessment(BaseModel):
     """The measured outcome of the fixed nine-step sandbox ramp."""
 
@@ -227,6 +236,7 @@ class AgentReport(BaseModel):
     analysis_engine: Annotated[str | None, Field(default=None, min_length=1, max_length=160)]
     ramp_assessment: RampAssessment | None = None
     evidence_inventory: EvidenceInventory | None = None
+    citation_exclusions: list[CitationExclusion] = Field(default_factory=list)
     generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

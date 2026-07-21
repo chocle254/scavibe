@@ -48,11 +48,18 @@ type RampAssessment = {
   observed_value: number | null;
   threshold: number | null;
 };
+type CitationExclusion = {
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  reason: "quote_does_not_match_cited_lines";
+};
 type Report = {
   stage: Stage;
   summary: string;
   findings: Finding[];
   limitations: string[];
+  citation_exclusions?: CitationExclusion[];
   evidence_commit_sha: string;
   generated_at?: string;
   ramp_assessment?: RampAssessment | null;
@@ -390,7 +397,8 @@ export default function Home() {
       } else if (event.type === "report_ready") {
         result = event.result;
         setProgress((current) => ({ ...current, [target]: 100 }));
-        addTrace(target, "Report ready: " + event.result.report.findings.length + " evidence-backed finding(s).", "success");
+        const exclusions = event.result.report.citation_exclusions?.length || 0;
+        addTrace(target, "Report ready: " + event.result.report.findings.length + " evidence-backed finding(s)" + (exclusions ? "; " + exclusions + " invalid citation(s) excluded." : "."), exclusions ? "warn" : "success");
       }
     });
     if (!result) throw new Error("The specialist stream ended without a report.");
@@ -685,6 +693,7 @@ export default function Home() {
           <Terminal stage={stage} trace={trace} coverage={coverage[stage]} progress={progress[stage]} auditing={operation === "auditing"} />
         </div>
         {activeResult ? <ReportPanel result={activeResult} busy={busy} approvals={sourceFixApproval} urls={sourceFixUrls} onApprovalChange={(key, approved) => setSourceFixApproval((current) => ({ ...current, [key]: approved }))} onCreateSourceFix={(findingIndex, fixType) => void createSourceFix(findingIndex, fixType)} /> : null}
+        {activeResult ? <CitationExclusionsPanel exclusions={activeResult.report.citation_exclusions || []} /> : null}
         {activeResult || coverage[stage] ? <EvidencePanel result={activeResult} coverage={coverage[stage]} /> : null}
         {activeResult ? <section className="action-card"><div><span className="eyebrow">Controlled next actions</span><h2>{stage === "legal" ? "Keep the data-handling and consent audit together." : "Turn the measured result into a reviewable artifact."}</h2><p>PDF exports preserve exact evidence, precomputed scores, limitations, timestamp, and pinned commit. The artifact PR adds the audit report and consent example only; it does not silently edit application code.</p></div><div className="action-buttons"><button className="secondary" disabled={busy} onClick={() => void downloadPdf(stage)}><Icon name="download" /> Download {stage === "legal" ? "data-handling" : stage} PDF</button>{stage === "legal" ? <button className="secondary" disabled={busy} onClick={() => void downloadConsent()}><Icon name="file" /> Consent checkbox example (.zip)</button> : null}<label className="checkline approval"><input type="checkbox" checked={prApproved} onChange={(event) => setPrApproved(event.target.checked)} /><span>I approve a draft PR containing audit artifacts, not unreviewed source-code edits.</span></label><button className="secondary" disabled={!prApproved || busy} onClick={() => void createArtifactPr()}><Icon name="branch" /> Create artifact PR</button>{prUrl ? <a className="pr-link" href={prUrl} target="_blank" rel="noreferrer">Open draft PR <Icon name="arrow" /></a> : null}{stage !== "legal" ? <button className="primary" disabled={busy} onClick={() => setStage(stage === "performance" ? "security" : "legal")}>Continue to {stage === "performance" ? "cybersecurity" : "data handling and consent"} <Icon name="arrow" /></button> : null}</div></section> : null}
         {allComplete ? <FinalAnalytics results={results as Record<Stage, StageResult>} total={totalFindings} busy={busy} onDownload={() => void downloadAll()} /> : null}
@@ -719,6 +728,11 @@ function EvidencePanel({ result, coverage }: { result?: StageResult; coverage?: 
   const complete = result ? result.repository.source_content_complete : coverage?.complete;
   const count = result ? paths.length : coverage?.selected || 0;
   return <section className="evidence-panel"><div><span className="eyebrow">Evidence scope</span><h2>Files actually supplied to this stage</h2><p>{complete ? "All supported text source files were supplied as evidence." : "This audit shows selected evidence. A capped source selection does not become a repository-wide absence claim."}</p></div><b>{count} source files</b>{result ? <div className="file-strip">{paths.map((path) => <code key={path}>{path}</code>)}</div> : <p className="evidence-pending">The live stream reports the verified count only. Exact paths appear after the sealed report is returned.</p>}</section>;
+}
+
+function CitationExclusionsPanel({ exclusions }: { exclusions: CitationExclusion[] }) {
+  if (exclusions.length === 0) return null;
+  return <section className="citation-exclusions"><span className="eyebrow">Evidence validation boundary</span><h2>Excluded source citations</h2><p>These model-proposed citations failed exact quote validation. They are not evidence, were not scored, and their related findings were excluded from this verdict.</p><ul>{exclusions.map((item) => <li key={item.file_path + item.start_line + item.end_line}><code>{item.file_path}</code> lines {item.start_line}-{item.end_line}: quote does not match the pinned source lines.</li>)}</ul></section>;
 }
 
 function FinalAnalytics({ results, total, busy, onDownload }: { results: Record<Stage, StageResult>; total: number; busy: boolean; onDownload: () => void }) {

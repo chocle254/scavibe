@@ -17,7 +17,7 @@ from main import (
     download_security_pdf,
     _stage_pdf_bytes,
 )
-from scavibe.contracts import AgentReport, AttackerAccess, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, Impact, RampAssessment, RuntimeMeasurement, SecurityPocExecution, Severity, SourceFile, Stage
+from scavibe.contracts import AgentReport, AttackerAccess, CitationExclusion, Evidence, EvidenceInventory, EvidenceKind, ExploitabilityStatus, Finding, Impact, RampAssessment, RuntimeMeasurement, SecurityPocExecution, Severity, SourceFile, Stage
 from scavibe.pdf_reports import build_stage_pdf, generate_pdf_report
 from scavibe.reporting import report_markdown
 import scavibe.pdf_reports as pdf_reports
@@ -174,6 +174,34 @@ class PdfExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(document.startswith(b"%PDF-"))
         self.assertTrue(document.rstrip().endswith(b"%%EOF"))
         self.assertGreater(len(document), 3_000)
+
+    async def test_pdf_identifies_excluded_citations_without_promoting_them_to_evidence(self) -> None:
+        report = report_for(Stage.SECURITY).model_copy(
+            update={
+                "citation_exclusions": [
+                    CitationExclusion(
+                        file_path="app/page.tsx",
+                        start_line=120,
+                        end_line=123,
+                        reason="quote_does_not_match_cited_lines",
+                    )
+                ]
+            }
+        )
+        with patch("scavibe.pdf_reports._paragraph", wraps=pdf_reports._paragraph) as paragraph:
+            document = build_stage_pdf(report)
+
+        rendered_text = [call.args[0] for call in paragraph.call_args_list]
+        markdown = report_markdown(report)
+        self.assertTrue(document.startswith(b"%PDF-"))
+        self.assertIn("Excluded source citations (1)", rendered_text)
+        self.assertIn("app/page.tsx lines 120-123: quote does not match the pinned source lines.", rendered_text)
+        self.assertIn(
+            "These model-proposed citations failed exact quote validation. They are not evidence, were not scored, and their related findings are excluded from this report.",
+            rendered_text,
+        )
+        self.assertIn("## Excluded source citations (1)", markdown)
+        self.assertIn("`app/page.tsx` lines 120-123: quote does not match the pinned source lines.", markdown)
 
     async def test_zero_finding_pdf_summarizes_evidence_scope_without_source_dump(self) -> None:
         inventory = EvidenceInventory(
